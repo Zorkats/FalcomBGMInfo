@@ -1,7 +1,7 @@
-# Falcom BGM Info Mod
+# Falcom BGM Info
 
 ## Introduction
-**Falcom BGM Info** is a quality-of-life mod for various Nihon Falcom games on PC. It displays an unobtrusive "Toast" notification at the top of the screen whenever the background music changes, showing the **Song Title**, **Japanese Title**, **Album**, and **Disc/Track number**.
+**Falcom BGM Info** is a quality-of-life mod for various Nihon Falcom games on PC. It displays an unobtrusive "Toast" notification at the top of the screen whenever the background music changes, showing the **Song Title**, **Japanese Title**, **Album**, and **Disc/Track number**, similar to how the newer PH3 Ports (Ys X: Nordics, and the Calvard Arc Trails games) do.
 
 It is designed to be lightweight, compatible with Steam Deck/Linux, and requires no configuration—just drag and drop to install.
 
