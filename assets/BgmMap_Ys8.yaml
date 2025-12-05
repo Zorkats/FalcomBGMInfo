@@ -1,0 +1,72 @@
+# Format: Title|Japanese Title|Disc|Track
+# Album: Ys VIII: Lacrimosa of DANA Original Soundtrack
+
+bgm\y8_op.ogg: "Lacrimosa of Dana -Opening Ver.-|LACRIMOSA OF DANA -Opening Ver.-|1|1"
+bgm\y8_title.ogg: "Lacrimosa of Dana|LACRIMOSA OF DANA|3|3"
+bgm\y8_end.ogg: "Everlasting Transeunt|EVERLASTING TRANSEUNT|3|14"
+
+# Field / Dungeon
+bgm\y8_d101.ogg: "Woods of Elevated Coral Reef|隆起珊瑚の森|1|13"
+bgm\y8_d201.ogg: "Tangled Jungle Trick|遠鳴り浜|1|16"
+bgm\y8_d301.ogg: "Eroded Valley|侵食谷|1|15"
+bgm\y8_d401.ogg: "Gens D'armes|ジャンダルム|2|5"
+bgm\y8_d501.ogg: "You'll See Out the End of the Tales|見届けの丘|3|6"
+bgm\y8_d502.ogg: "Corridor of the Lost Ages|古の地下遺跡|3|7"
+bgm\y8_d503.ogg: "Lacrimosa of Dana -Opening Ver.-|LACRIMOSA OF DANA -Opening Ver.-|1|1"
+bgm\y8_d601.ogg: "The Leaning Tower Baja|バハの斜塔|2|17"
+bgm\y8_d701.ogg: "The Valley of the Kings|王家の谷|3|4"
+bgm\y8_d801.ogg: "Crevice of the Archeozoic Era|始生代の大穴|2|20"
+bgm\y8_d901.ogg: "A Waterdrop in the Dark|暗がりの雫|1|9"
+bgm\y8_d902.ogg: "Neglected Temple|見捨てられた教会|2|14"
+bgm\y8_d903.ogg: "Haunted Ocean|幽霊船|2|18"
+bgm\y8_d910.ogg: "Riddles of the Labyrinth|迷宮の謎|3|17"
+bgm\y8_d911.ogg: "Vanishing Trail|足跡は消ゆ|3|20"
+bgm\y8_d920.ogg: "Night Survivor|ナイトサバイバー|3|16"
+
+# Field (Plains/Coast)
+bgm\y8_f101.ogg: "Sunshine Coastline|SUNSHINE COASTLINE|1|5"
+bgm\y8_f201.ogg: "A Footprint in the Wet Sand|濡れた足跡|1|11"
+bgm\y8_f301.ogg: "Lost in Green|ＬＯＳＴ ＩＮ ＧＲＥＥＮ|1|14"
+bgm\y8_f401.ogg: "Overcome the Rocky Path|岩場を抜けて|2|4"
+bgm\y8_f501.ogg: "Next Step Toward the Unknown|未知への足音|2|9"
+bgm\y8_f601.ogg: "A Slow and Deep Breath|深呼吸|2|11"
+bgm\y8_f701.ogg: "Great Plains: Pan-Gaia|パンガイア大平原|2|12"
+bgm\y8_f801.ogg: "Iclucian Dance|イクルシアン・ダンス|2|16"
+bgm\y8_f901.ogg: "The Sybilline Road|巫女の道|2|2"
+
+# Town / Story
+bgm\y8_t101.ogg: "The Drifting Village|漂流村|1|10"
+bgm\y8_t301.ogg: "Royal Capital Aigius|王都アイギアス|2|10"
+bgm\y8_t401.ogg: "Yesterday in Etania|エタニアの面影|2|1"
+bgm\y8_t501.ogg: "Home from Home|HOME FROM HOME|2|3"
+
+# Battle
+bgm\y8_b001.ogg: "Crimson Fighter|CRIMSON FIGHTER|1|19"
+bgm\y8_b002.ogg: "Smash Up!|SMASH UP!|1|7"
+bgm\y8_b003.ogg: "Deadly Temptation|DEADLY TEMPTATION|1|4"
+bgm\y8_b004.ogg: "Volitional Decision|VOLITIONAL DECISION|3|8"
+bgm\y8_b005.ogg: "Oceanos|オケアノス|2|21"
+bgm\y8_b006.ogg: "Theos-De-Endrogram|THEOS-DE-ENDROGRAM|3|9"
+bgm\y8_b007.ogg: "A-to-Z|A-TO-Z|3|13"
+bgm\y8_b008.ogg: "Red Line -021-|RED LINE -021-|2|7"
+bgm\y8_b009.ogg: "Origene Della Vita|ORIGINE DELLA VITA|3|12"
+bgm\y8_b010.ogg: "All-Out Attack!|ALL-OUT ATTACK!|3|15"
+bgm\y8_b011.ogg: "Hope Alive|HOPE ALIVE|3|19"
+
+# Events
+bgm\y8_e001.ogg: "Whismical Vacation|気ままな一時|1|6"
+bgm\y8_e002.ogg: "One Dream, One Reality|夢と現|2|13"
+bgm\y8_e003.ogg: "Being Slow on the Waves|波間に揺られて|1|2"
+bgm\y8_e004.ogg: "Alone on the Deserted Island|無人島|1|8"
+bgm\y8_e005.ogg: "Sound of Night|夜の音|1|12"
+bgm\y8_e007.ogg: "A Modest Banquet at Lombardia|ロンバルディア号の宴|1|3"
+bgm\y8_e008.ogg: "Obscure Sentence|ＯＢＳＣＵＲＥ ＳＥＮＴＥＮＣＥ|2|8"
+bgm\y8_e010.ogg: "Mysterious Seiren|神秘の島セイレン|1|17"
+bgm\y8_e011.ogg: "Endless Crisis|迫りくる危機|3|2"
+bgm\y8_e012.ogg: "Steel Myself for Battle|戦いへの決意|2|6"
+bgm\y8_e013.ogg: "Garden of Celen|セレンの園|3|5"
+bgm\y8_e015.ogg: "Dana|ダーナ|3|15"
+bgm\y8_e016.ogg: "Ricordo|RICORDO|1|20"
+bgm\y8_e017.ogg: "Invisible Exit|見えない出口|1|18"
+bgm\y8_e018.ogg: "Maia|MAIA|3|10"
+bgm\y8_e019.ogg: "Doni Della Terra|DONI DELLA TERRA|2|19"
