@@ -205,6 +205,8 @@ static float g_toastTimer = 0.0f;
 constexpr float TOAST_DURATION_SECONDS = 5.0f;
 constexpr int COOLDOWN_HOURS = 5;
 static float g_toastCurrentX = -10000.0f;
+static float g_lastDisplayWidth = 0.0f;
+static float g_lastDisplayHeight = 0.0f;
 
 static bool g_imguiInitialized = false;
 static HWND g_hWindow = nullptr;
@@ -219,8 +221,8 @@ static float g_TextureHeight = 0.0f;
 static std::thread g_workerThread;
 static std::mutex g_bufferMutex;
 static char g_bgmFilenameBuffer[MAX_PATH];
+static std::atomic<bool> g_bNewBgmAvailable = false;
 static std::atomic<bool> g_bWorkerThreadActive = true;
-static std::vector<std::string> g_bgmQueue;
 
 // =============================================================
 // D3D11 STATE SAVER
@@ -484,6 +486,15 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         io.DisplaySize.y = actual_height;
     }
 
+    // Detect resolution change and reset toast animation if needed
+    if (actual_width != g_lastDisplayWidth || actual_height != g_lastDisplayHeight) {
+        g_lastDisplayWidth = actual_width;
+        g_lastDisplayHeight = actual_height;
+        if (g_toastCurrentX != -10000.0f && g_toastTimer > 0.0f) {
+            g_toastCurrentX = -10000.0f;
+        }
+    }
+
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
 
@@ -505,7 +516,11 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
     std::string line5 = g_currentBgmInfo.album;
 
     if (g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) {
-        if (g_pToastFont) ImGui::PushFont(g_pToastFont);
+        bool fontPushed = false;
+        if (g_pToastFont && g_pToastFont->IsLoaded()) {
+            ImGui::PushFont(g_pToastFont);
+            fontPushed = true;
+        }
 
         ImVec2 s1 = ImGui::CalcTextSize(line1.c_str());
         ImVec2 s2 = ImGui::CalcTextSize(line2.c_str());
@@ -515,6 +530,12 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
 
         float text_width = std::max({s1.x, s2.x, s3.x, s4.x, s5.x});
         float line_height = s1.y > 0 ? s1.y : 28.0f;
+
+        // Minimum width fallback (estimate ~8px per character if font fails)
+        if (text_width < 50.0f) {
+            size_t maxLen = std::max({line1.length(), line2.length(), line3.length(), line4.length(), line5.length()});
+            text_width = std::max(text_width, (float)maxLen * 8.0f);
+        }
 
         int line_count = 0;
         if (!line1.empty()) line_count++;
@@ -532,7 +553,12 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         float screen_width = io.DisplaySize.x;
         float top_y = SCREEN_PADDING;
 
-        float target_onscreen_x = screen_width - total_width - SCREEN_PADDING;
+        // Clamp toast width to 80% of screen to prevent overflow
+        float maxWidth = screen_width * 0.8f;
+        float effectiveWidth = std::min(total_width, maxWidth);
+
+        float target_onscreen_x = screen_width - effectiveWidth - SCREEN_PADDING;
+        if (target_onscreen_x < SCREEN_PADDING) target_onscreen_x = SCREEN_PADDING;
         float target_offscreen_x = screen_width + SCREEN_PADDING;
 
         if (g_toastCurrentX == -10000.0f) {
@@ -557,7 +583,7 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         }
 
         if (g_toastCurrentX != -10000.0f) {
-            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
             float y = top_y;
 
             dl->AddRectFilled(
@@ -589,7 +615,7 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
             DrawLine(line5, IM_COL32(180, 180, 180, 255));
         }
 
-        if (g_pToastFont) ImGui::PopFont();
+        if (fontPushed) ImGui::PopFont();
     }
 
     ImGui::Render();
@@ -641,11 +667,13 @@ typedef HANDLE(WINAPI* PFN_CREATEFILEW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIB
 static PFN_CREATEFILEW g_pfnOriginalCreateFileW = nullptr;
 HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
     if (lpFileName && IsTargetFileW(lpFileName)) {
-        char buf[MAX_PATH];
-        WCharToString(lpFileName, buf, MAX_PATH);
-
-        std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_bgmQueue.emplace_back(buf); // PUSH TO QUEUE
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                WCharToString(lpFileName, g_bgmFilenameBuffer, MAX_PATH);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
     }
     return g_pfnOriginalCreateFileW(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -654,8 +682,13 @@ typedef HANDLE(WINAPI* PFN_CREATEFILEA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBU
 static PFN_CREATEFILEA g_pfnOriginalCreateFileA = nullptr;
 HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
     if (lpFileName && IsTargetFile(lpFileName)) {
-        std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_bgmQueue.emplace_back(lpFileName); // PUSH TO QUEUE
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, lpFileName);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
     }
     return g_pfnOriginalCreateFileA(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -664,8 +697,13 @@ typedef void(__fastcall* PFN_SOUNDMANAGER)(uintptr_t rcx, const char* rdx_filena
 static PFN_SOUNDMANAGER g_pfnOriginalSoundManager = nullptr;
 void __fastcall My_SoundManager(uintptr_t rcx, const char* rdx_filename, uintptr_t r8, uintptr_t r9) {
     if (rdx_filename) {
-        std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_bgmQueue.emplace_back(rdx_filename); // PUSH TO QUEUE
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, rdx_filename);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
     }
     g_pfnOriginalSoundManager(rcx, rdx_filename, r8, r9);
 }
@@ -719,21 +757,15 @@ void ProcessBgmTrigger(const std::string& s_filename) {
 void BgmWorkerThread() {
     Log("BGM Worker Thread started.");
     while (g_bWorkerThreadActive) {
-        // CONSUME QUEUE (Thread-Safe)
-        std::vector<std::string> localQueue;
-        {
-            std::lock_guard<std::mutex> lock(g_bufferMutex);
-            if (!g_bgmQueue.empty()) {
-                localQueue = g_bgmQueue;
-                g_bgmQueue.clear();
+        if (g_bNewBgmAvailable) {
+            std::string fname;
+            {
+                std::lock_guard<std::mutex> lock(g_bufferMutex);
+                fname = g_bgmFilenameBuffer;
+                g_bNewBgmAvailable = false;
             }
-        }
-
-        // Process all queued files
-        for (const auto& fname : localQueue) {
             ProcessBgmTrigger(fname);
         }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     Log("BGM Worker Thread shutting down.");

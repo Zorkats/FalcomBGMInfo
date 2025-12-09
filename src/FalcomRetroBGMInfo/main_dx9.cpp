@@ -31,12 +31,14 @@
 // =============================================================
 enum class GameID {
     Unknown,
-    SkyFC,
     XanaduNext,
     YsSeven,
     YsOrigin,
     YsVI,
-    YsFelghana
+    YsFelghana,
+    SkyFC,
+    SkySC,
+    Sky3rd
 };
 
 struct GameConfig {
@@ -104,9 +106,10 @@ void DetectAndConfigure() {
     else if (exe.find("ys7.exe") != std::string::npos) {
         g_CurrentGame = GameID::YsSeven;
         g_Config.gameName = "Ys Seven";
-        g_Config.windowTitlePart = "Ys Seven";
+        g_Config.windowTitlePart = "Ys7";
         g_Config.yamlFiles.push_back("BgmMap_Ys7.yaml");
-        g_Config.useFileHook = true;
+        g_Config.useRvaHook = true;
+        g_Config.bgmFuncRVA = 0x1445E0;  // InternalFopen
     }
     else if (exe.find("yso_win.exe") != std::string::npos) {
         g_CurrentGame = GameID::YsOrigin;
@@ -129,11 +132,25 @@ void DetectAndConfigure() {
         g_Config.yamlFiles.push_back("BgmMap_YsFelghana.yaml");
         g_Config.useFileHook = true;
     }
-    else if (exe.find("ed6_win_dx9.exe") != std::string::npos) {
+    else if (exe.find("ed6_win_dx9.exe") != std::string::npos || exe.find("ed6_win.exe") != std::string::npos) {
         g_CurrentGame = GameID::SkyFC;
-        g_Config.gameName= "The Legend of Heroes: Trails in the Sky";
+        g_Config.gameName = "Trails in the Sky FC";
         g_Config.windowTitlePart = "Trails in the Sky";
         g_Config.yamlFiles.push_back("BgmMap_SkyFC.yaml");
+        g_Config.useFileHook = true;
+    }
+    else if (exe.find("ed6_win2_dx9.exe") != std::string::npos || exe.find("ed6_win2.exe") != std::string::npos) {
+        g_CurrentGame = GameID::SkySC;
+        g_Config.gameName = "Trails in the Sky SC";
+        g_Config.windowTitlePart = "Trails in the Sky";
+        g_Config.yamlFiles.push_back("BgmMap_SkySC.yaml");
+        g_Config.useFileHook = true;
+    }
+    else if (exe.find("ed6_win3_dx9.exe") != std::string::npos || exe.find("ed6_win3.exe") != std::string::npos) {
+        g_CurrentGame = GameID::Sky3rd;
+        g_Config.gameName = "Trails in the Sky the 3rd";
+        g_Config.windowTitlePart = "Trails in the Sky";
+        g_Config.yamlFiles.push_back("BgmMap_Sky3rd.yaml");
         g_Config.useFileHook = true;
     }
     else {
@@ -175,6 +192,8 @@ static float g_currentNoteIconWidth = 0.0f;
 static float g_currentBoxWidth = 0.0f;
 static float g_currentTextHeight = 0.0f;
 static float g_currentLineHeight = 28.0f;
+static float g_lastDisplayWidth = 0.0f;
+static float g_lastDisplayHeight = 0.0f;
 
 static bool g_imguiInitialized = false;
 static HWND g_hWindow = nullptr;
@@ -186,10 +205,8 @@ static float g_TextureHeight = 0.0f;
 static std::thread g_workerThread;
 static std::mutex g_bufferMutex;
 static char g_bgmFilenameBuffer[MAX_PATH];
+static std::atomic<bool> g_bNewBgmAvailable = false;
 static std::atomic<bool> g_bWorkerThreadActive = true;
-static std::vector<std::string> g_bgmQueue; // Stores pending files
-
-
 
 // =============================================================
 // YAML PARSER
@@ -277,6 +294,15 @@ LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
 }
 
+// Forward declarations for functions defined later
+typedef HANDLE(WINAPI* PFN_CREATEFILEW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef HANDLE(WINAPI* PFN_CREATEFILEA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static PFN_CREATEFILEW g_pfnOriginalCreateFileW = nullptr;
+static PFN_CREATEFILEA g_pfnOriginalCreateFileA = nullptr;
+HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate);
+HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate);
+void BgmWorkerThread();
+
 void LoadDdsTexture(IDirect3DDevice9* pDevice) {
     std::string texturePathStr = GetModDirectory() + "\\assets/bgm_info.dds";
     HRESULT hr = D3DXCreateTextureFromFileA(pDevice, texturePathStr.c_str(), &g_pToastTexture);
@@ -293,6 +319,21 @@ void LoadDdsTexture(IDirect3DDevice9* pDevice) {
 
 void InitImGui(IDirect3DDevice9* pDevice) {
     if (g_imguiInitialized) return;
+
+    // Ensure we have a valid window handle
+    if (!g_hWindow) {
+        // Try to get window from device creation parameters
+        D3DDEVICE_CREATION_PARAMETERS params;
+        if (SUCCEEDED(pDevice->GetCreationParameters(&params))) {
+            g_hWindow = params.hFocusWindow;
+            Log("Window obtained from device creation params: " + std::to_string((uintptr_t)g_hWindow));
+        }
+    }
+
+    if (!g_hWindow) {
+        Log("InitImGui: No valid window handle, skipping initialization");
+        return;
+    }
 
     Log("InitImGui called.");
 
@@ -321,6 +362,29 @@ void InitImGui(IDirect3DDevice9* pDevice) {
 
     Log("ImGui initialized successfully.");
     g_imguiInitialized = true;
+
+    // Set up file hooks now that the game has fully initialized
+    // This avoids interfering with initial audio loading
+    if (g_Config.useFileHook) {
+        g_bWorkerThreadActive = true;
+        g_workerThread = std::thread(BgmWorkerThread);
+
+        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+        if (hKernel32) {
+            void* pCreateFileW = (void*)GetProcAddress(hKernel32, "CreateFileW");
+            if (pCreateFileW) {
+                MH_CreateHook(pCreateFileW, &Detour_CreateFileW, (LPVOID*)&g_pfnOriginalCreateFileW);
+                Log("Hooked CreateFileW");
+            }
+
+            void* pCreateFileA = (void*)GetProcAddress(hKernel32, "CreateFileA");
+            if (pCreateFileA) {
+                MH_CreateHook(pCreateFileA, &Detour_CreateFileA, (LPVOID*)&g_pfnOriginalCreateFileA);
+                Log("Hooked CreateFileA");
+            }
+            MH_EnableHook(MH_ALL_HOOKS);
+        }
+    }
 }
 
 HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
@@ -331,10 +395,42 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     ImGui::NewFrame();
 
     ImGuiIO& io = ImGui::GetIO();
-    D3DVIEWPORT9 viewport;
-    pDevice->GetViewport(&viewport);
-    io.DisplaySize.x = (float)viewport.Width;
-    io.DisplaySize.y = (float)viewport.Height;
+
+    // Get actual render target dimensions (more reliable than viewport)
+    float displayWidth = 0.0f;
+    float displayHeight = 0.0f;
+
+    IDirect3DSurface9* pBackBuffer = nullptr;
+    if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBackBuffer))) {
+        D3DSURFACE_DESC desc;
+        if (SUCCEEDED(pBackBuffer->GetDesc(&desc))) {
+            displayWidth = (float)desc.Width;
+            displayHeight = (float)desc.Height;
+        }
+        pBackBuffer->Release();
+    }
+
+    // Fallback to viewport if backbuffer query failed
+    if (displayWidth <= 0.0f || displayHeight <= 0.0f) {
+        D3DVIEWPORT9 viewport;
+        pDevice->GetViewport(&viewport);
+        displayWidth = (float)viewport.Width;
+        displayHeight = (float)viewport.Height;
+    }
+
+    io.DisplaySize.x = displayWidth;
+    io.DisplaySize.y = displayHeight;
+
+    // Detect resolution change and force layout recalculation
+    bool resolutionChanged = (displayWidth != g_lastDisplayWidth || displayHeight != g_lastDisplayHeight);
+    if (resolutionChanged) {
+        g_lastDisplayWidth = displayWidth;
+        g_lastDisplayHeight = displayHeight;
+        // Force layout recalculation by resetting position
+        if (g_toastCurrentX != -10000.0f && g_toastTimer > 0.0f) {
+            g_toastCurrentX = -10000.0f;
+        }
+    }
 
     if (!g_pToastTexture) LoadDdsTexture(pDevice);
 
@@ -344,8 +440,16 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     const float TEXT_PADDING_Y = 15.0f * UI_SCALE;
     const float ROUNDING = 8.0f * UI_SCALE;
 
-    if (g_toastTimer > 0.0f && g_toastCurrentX == -10000.0f) {
-        if (g_pToastFont) ImGui::PushFont(g_pToastFont);
+    // Calculate layout every frame (not cached) to handle resolution changes and font issues
+    bool needsLayoutCalc = (g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f);
+    bool needsInitialPosition = (g_toastTimer > 0.0f && g_toastCurrentX == -10000.0f);
+
+    if (needsLayoutCalc) {
+        bool fontPushed = false;
+        if (g_pToastFont && g_pToastFont->IsLoaded()) {
+            ImGui::PushFont(g_pToastFont);
+            fontPushed = true;
+        }
 
         ImVec2 s1 = ImGui::CalcTextSize(g_currentBgmInfo.songName.c_str());
         g_currentLineHeight = s1.y > 0 ? s1.y : 28.0f;
@@ -353,10 +457,21 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
         float w1 = s1.x;
         float w2 = ImGui::CalcTextSize(g_currentBgmInfo.japaneseName.c_str()).x;
         float w3 = ImGui::CalcTextSize(g_currentBgmInfo.album.c_str()).x;
-        std::string discTrack = (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) 
+        std::string discTrack = (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty())
             ? "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track : "";
         float w4 = ImGui::CalcTextSize(discTrack.c_str()).x;
         float text_width = std::max({w1, w2, w3, w4});
+
+        // Minimum width fallback (estimate ~8px per character if font fails)
+        if (text_width < 50.0f) {
+            size_t maxLen = std::max({
+                g_currentBgmInfo.songName.length(),
+                g_currentBgmInfo.japaneseName.length(),
+                g_currentBgmInfo.album.length(),
+                discTrack.length()
+            });
+            text_width = std::max(text_width, (float)maxLen * 8.0f);
+        }
 
         int line_count = 0;
         if (!g_currentBgmInfo.songName.empty()) line_count++;
@@ -366,21 +481,31 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
 
         g_currentTextHeight = g_currentLineHeight * (float)line_count + (g_currentLineHeight * 0.2f * (line_count - 1));
 
-        if (g_pToastFont) ImGui::PopFont();
+        if (fontPushed) ImGui::PopFont();
 
         g_currentToastTotalHeight = g_currentTextHeight + (TEXT_PADDING_Y * 2.0f);
         g_currentNoteIconWidth = g_currentToastTotalHeight;
         g_currentBoxWidth = text_width + (TEXT_PADDING_X * 2.0f);
         g_currentToastTotalWidth = g_currentNoteIconWidth + g_currentBoxWidth;
 
-        g_toastCurrentX = io.DisplaySize.x + SCREEN_PADDING;
+        if (needsInitialPosition) {
+            g_toastCurrentX = io.DisplaySize.x + SCREEN_PADDING;
+        }
     }
 
     if (g_toastCurrentX != -10000.0f) {
-        float target = io.DisplaySize.x - g_currentToastTotalWidth - SCREEN_PADDING;
+        // Clamp toast width to reasonable maximum (80% of screen width)
+        float maxToastWidth = io.DisplaySize.x * 0.8f;
+        float effectiveWidth = std::min(g_currentToastTotalWidth, maxToastWidth);
+
+        float target = io.DisplaySize.x - effectiveWidth - SCREEN_PADDING;
+        // Safety: ensure target is always positive
+        if (target < SCREEN_PADDING) target = SCREEN_PADDING;
+
         float dt = io.DeltaTime;
         if (g_toastTimer > 0.0f) {
             if (g_toastCurrentX > target) g_toastCurrentX -= 1500.0f * dt;
+            if (g_toastCurrentX < target) g_toastCurrentX = target; // Clamp to target
             g_toastTimer -= dt;
         } else {
             if (g_toastCurrentX < io.DisplaySize.x + SCREEN_PADDING) g_toastCurrentX += 1500.0f * dt;
@@ -389,19 +514,23 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     }
 
     if (g_toastCurrentX != -10000.0f) {
-        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
         ImVec2 p_box(g_toastCurrentX + g_currentNoteIconWidth, SCREEN_PADDING);
         dl->AddRectFilled(p_box, ImVec2(p_box.x + g_currentBoxWidth, SCREEN_PADDING + g_currentToastTotalHeight), IM_COL32(0, 0, 0, 180), ROUNDING);
 
         if (g_pToastTexture) {
-            dl->AddImage((void*)g_pToastTexture, 
-                ImVec2(g_toastCurrentX, SCREEN_PADDING), 
+            dl->AddImage((void*)g_pToastTexture,
+                ImVec2(g_toastCurrentX, SCREEN_PADDING),
                 ImVec2(g_toastCurrentX + g_currentNoteIconWidth, SCREEN_PADDING + g_currentToastTotalHeight));
         }
 
         float current_y = SCREEN_PADDING + (g_currentToastTotalHeight - g_currentTextHeight) * 0.5f;
 
-        if (g_pToastFont) ImGui::PushFont(g_pToastFont);
+        bool fontPushed = false;
+        if (g_pToastFont && g_pToastFont->IsLoaded()) {
+            ImGui::PushFont(g_pToastFont);
+            fontPushed = true;
+        }
 
         auto DrawLine = [&](const std::string& s, ImU32 col) {
             if (!s.empty()) {
@@ -412,12 +541,12 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
 
         DrawLine(g_currentBgmInfo.songName, IM_COL32_WHITE);
         DrawLine(g_currentBgmInfo.japaneseName, IM_COL32(200, 200, 200, 255));
-        std::string line3 = (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) 
+        std::string line3 = (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty())
             ? "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track : "";
         DrawLine(line3, IM_COL32(180, 180, 180, 255));
         DrawLine(g_currentBgmInfo.album, IM_COL32(180, 180, 180, 255));
 
-        if (g_pToastFont) ImGui::PopFont();
+        if (fontPushed) ImGui::PopFont();
     }
 
     ImGui::EndFrame();
@@ -449,29 +578,28 @@ bool IsTargetFileW(const std::wstring& fname) {
     return (ext == L".ogg" || ext == L".wav");
 }
 
-typedef HANDLE(WINAPI* PFN_CREATEFILEW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-static PFN_CREATEFILEW g_pfnOriginalCreateFileW = nullptr;
-
 HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
     if (lpFileName && IsTargetFileW(lpFileName)) {
-        char buf[MAX_PATH];
-        WCharToString(lpFileName, buf, MAX_PATH);
-
-        // FIX: Queue it, don't drop it
-        std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_bgmQueue.push_back(std::string(buf));
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                WCharToString(lpFileName, g_bgmFilenameBuffer, MAX_PATH);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
     }
     return g_pfnOriginalCreateFileW(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
 
-typedef HANDLE(WINAPI* PFN_CREATEFILEA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-static PFN_CREATEFILEA g_pfnOriginalCreateFileA = nullptr;
-
 HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
     if (lpFileName && IsTargetFile(lpFileName)) {
-        // FIX: Queue it, don't drop it
-        std::lock_guard<std::mutex> lock(g_bufferMutex);
-        g_bgmQueue.push_back(std::string(lpFileName));
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, lpFileName);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
     }
     return g_pfnOriginalCreateFileA(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -525,31 +653,23 @@ void ProcessBgmTrigger(const std::string& s_filename) {
     }
 }
 
-void BgmWorkerThread()
-{
+void BgmWorkerThread() {
     Log("BGM Worker Thread started.");
     while (g_bWorkerThreadActive) {
-
-        // 1. GRAB DATA SAFELY
-        std::vector<std::string> localQueue;
-        {
-            std::lock_guard<std::mutex> lock(g_bufferMutex);
-            if (!g_bgmQueue.empty()) {
-                localQueue = g_bgmQueue; // Copy everything
-                g_bgmQueue.clear();      // Clear the global queue
+        if (g_bNewBgmAvailable) {
+            std::string fname;
+            {
+                std::lock_guard<std::mutex> lock(g_bufferMutex);
+                fname = g_bgmFilenameBuffer;
+                g_bNewBgmAvailable = false;
             }
-        }
-
-        // 2. PROCESS DATA
-        // Now we can take our time processing without blocking the game
-        for (const auto& fname : localQueue) {
             ProcessBgmTrigger(fname);
         }
-
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     Log("BGM Worker Thread shutting down.");
 }
+
 // =============================================================
 // XANADU NEXT RVA HOOK (NAKED ASSEMBLY)
 // =============================================================
@@ -576,7 +696,7 @@ void __stdcall ProcessXanaduBgmLogic(int songID) {
 }
 
 #ifdef _M_IX86
-void __declspec(naked) Detour_PlayBgm_ASM() {
+void __declspec(naked) Detour_PlayBgm_Xanadu() {
     __asm {
         pushad
         pushfd
@@ -587,6 +707,86 @@ void __declspec(naked) Detour_PlayBgm_ASM() {
         jmp [g_pfnOriginalPlayBgm]
     }
 }
+
+// =============================================================
+// YS7 / GENERIC FOPEN RVA HOOK (NAKED ASSEMBLY)
+// =============================================================
+static void* g_pfnOriginalInternalFopen = nullptr;
+
+// Try to extract .ogg filename from a memory address
+bool __stdcall TryExtractOgg(DWORD candidateAddr) {
+    // 1. Basic pointer validation
+    if (candidateAddr < 0x10000 || candidateAddr > 0x7FFFFFFF) return false;
+    if (IsBadReadPtr((void*)candidateAddr, 4)) return false;
+
+    // 2. Check first char (must be printable text, not control char)
+    char* pStr = (char*)candidateAddr;
+    if (pStr[0] < 32 || pStr[0] > 126) return false;
+
+    // 3. Scan length (limit to MAX_PATH to prevent hangs)
+    size_t len = 0;
+    while (len < MAX_PATH) {
+        if (IsBadReadPtr(&pStr[len], 1)) return false;
+        if (pStr[len] == 0) break;
+        len++;
+    }
+
+    if (len < 4 || len >= MAX_PATH) return false;
+
+    // 4. Check extension for .ogg (Case insensitive)
+    if (tolower(pStr[len - 1]) == 'g' &&
+        tolower(pStr[len - 2]) == 'g' &&
+        tolower(pStr[len - 3]) == 'o' &&
+        pStr[len - 4] == '.')
+    {
+        // FOUND IT!
+        if (g_bufferMutex.try_lock()) {
+            if (!g_bNewBgmAvailable) {
+                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, pStr);
+                g_bNewBgmAvailable = true;
+            }
+            g_bufferMutex.unlock();
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void __declspec(naked) Detour_InternalFopen() {
+    __asm {
+        // 1. Save ALL registers
+        pushad
+        pushfd
+
+        // 2. SEARCH FOR THE FILENAME
+        // Check ECX (Fastcall/Thiscall)
+        push ecx
+        call TryExtractOgg
+        test al, al
+        jnz _found
+
+        // Check Stack Argument 1 (ESP+40 after pushad/pushfd)
+        mov eax, [esp + 40]
+        push eax
+        call TryExtractOgg
+        test al, al
+        jnz _found
+
+        // Check Stack Argument 2
+        mov eax, [esp + 44]
+        push eax
+        call TryExtractOgg
+
+    _found:
+        // 3. Restore ALL registers
+        popfd
+        popad
+
+        // 4. Jump to original
+        jmp [g_pfnOriginalInternalFopen]
+    }
+}
 #endif
 
 // =============================================================
@@ -595,6 +795,15 @@ void __declspec(naked) Detour_PlayBgm_ASM() {
 HRESULT WINAPI Detour_CreateDevice(IDirect3D9* pD3D, UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DDevice9** ppReturnedDeviceInterface) {
     HRESULT hr = g_pfnOriginalCreateDevice(pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface && !g_bEndSceneHooked) {
+        // Capture window handle from CreateDevice call
+        if (hFocusWindow) {
+            g_hWindow = hFocusWindow;
+            Log("Window captured from CreateDevice: " + std::to_string((uintptr_t)hFocusWindow));
+        } else if (pPresentationParameters && pPresentationParameters->hDeviceWindow) {
+            g_hWindow = pPresentationParameters->hDeviceWindow;
+            Log("Window captured from PresentationParameters: " + std::to_string((uintptr_t)g_hWindow));
+        }
+
         IDirect3DDevice9* pDevice = *ppReturnedDeviceInterface;
         void** pVTable = *(void***)pDevice;
         MH_CreateHook((LPVOID)pVTable[42], &My_EndScene, (LPVOID*)&g_pfnOriginalEndScene);
@@ -609,24 +818,7 @@ HRESULT WINAPI Detour_CreateDevice(IDirect3D9* pD3D, UINT Adapter, D3DDEVTYPE De
 IDirect3D9* WINAPI Detour_Direct3DCreate9(UINT SDKVersion) {
     IDirect3D9* pD3D = g_pfnOriginalDirect3DCreate9(SDKVersion);
 
-    while (g_hWindow == NULL) {
-        if (!g_Config.windowTitlePart.empty()) {
-            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-                char title[256];
-                GetWindowTextA(hwnd, title, 256);
-                if (std::string(title).find(g_Config.windowTitlePart) != std::string::npos) {
-                    g_hWindow = hwnd;
-                    return FALSE;
-                }
-                return TRUE;
-            }, 0);
-        }
-        if (!g_hWindow) {
-            Log("Searching for " + g_Config.gameName + " window...");
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-    }
-    Log(g_Config.gameName + " window found!");
+    Log("Direct3DCreate9 called, setting up hooks...");
 
     LoadBgmMap();
 
@@ -637,37 +829,36 @@ IDirect3D9* WINAPI Detour_Direct3DCreate9(UINT SDKVersion) {
         Log("CreateDevice hooked.");
     }
 
-    if (g_Config.useFileHook) {
-        g_bWorkerThreadActive = true;
-        g_workerThread = std::thread(BgmWorkerThread);
-
-        HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-        if (hKernel32) {
-            void* pCreateFileW = (void*)GetProcAddress(hKernel32, "CreateFileW");
-            if (pCreateFileW) {
-                MH_CreateHook(pCreateFileW, &Detour_CreateFileW, (LPVOID*)&g_pfnOriginalCreateFileW);
-                Log("Hooked CreateFileW");
-            }
-
-            void* pCreateFileA = (void*)GetProcAddress(hKernel32, "CreateFileA");
-            if (pCreateFileA) {
-                MH_CreateHook(pCreateFileA, &Detour_CreateFileA, (LPVOID*)&g_pfnOriginalCreateFileA);
-                Log("Hooked CreateFileA");
-            }
-            MH_EnableHook(MH_ALL_HOOKS);
-        }
-    }
+    // File hooks will be set up later in InitImGui to avoid interfering with game audio init
 
 #ifdef _M_IX86
     if (g_Config.useRvaHook && g_Config.bgmFuncRVA != 0) {
         uintptr_t baseAddr = (uintptr_t)GetModuleHandle(NULL);
         uintptr_t targetAddr = baseAddr + g_Config.bgmFuncRVA;
 
-        if (MH_CreateHook((LPVOID)targetAddr, &Detour_PlayBgm_ASM, (LPVOID*)&g_pfnOriginalPlayBgm) == MH_OK) {
-            MH_EnableHook((LPVOID)targetAddr);
-            Log("BGM RVA Hook Successful at: 0x" + std::to_string(targetAddr));
+        // Start worker thread for RVA hooks that use the buffer
+        if (g_CurrentGame != GameID::XanaduNext) {
+            g_bWorkerThreadActive = true;
+            g_workerThread = std::thread(BgmWorkerThread);
+        }
+
+        // Use appropriate hook for each game type
+        if (g_CurrentGame == GameID::XanaduNext) {
+            // Xanadu Next: song ID in ECX
+            if (MH_CreateHook((LPVOID)targetAddr, &Detour_PlayBgm_Xanadu, (LPVOID*)&g_pfnOriginalPlayBgm) == MH_OK) {
+                MH_EnableHook((LPVOID)targetAddr);
+                Log("Xanadu Next BGM Hook Successful at: 0x" + std::to_string(targetAddr));
+            } else {
+                Log("FATAL: Failed to hook Xanadu Next BGM function");
+            }
         } else {
-            Log("FATAL: Failed to hook BGM function at 0x" + std::to_string(targetAddr));
+            // Ys7 and similar: filename string in ECX or stack
+            if (MH_CreateHook((LPVOID)targetAddr, &Detour_InternalFopen, (LPVOID*)&g_pfnOriginalInternalFopen) == MH_OK) {
+                MH_EnableHook((LPVOID)targetAddr);
+                Log("InternalFopen Hook Successful at: 0x" + std::to_string(targetAddr));
+            } else {
+                Log("FATAL: Failed to hook InternalFopen function");
+            }
         }
     }
 #endif
@@ -706,7 +897,12 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         InitializeMod();
-    } else if (fdwReason == DLL_PROCESS_DETACH){
     }
+    else if (fdwReason == DLL_PROCESS_DETACH) {
+        // Minimal cleanup only - full cleanup causes hanging in some games
+        // (Ys: The Oath in Felghana, Xanadu Next, etc.)
+        g_bWorkerThreadActive = false;
+    }
+
     return TRUE;
 }
