@@ -11,16 +11,16 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 
 ### Modern (DirectX 11)
 * **The Legend of Heroes: Trails in the Sky the 1st** (Remake)
-* **The Legend of Heroes: Trails of Cold Steel I & II**
+* **The Legend of Heroes: Trails of Cold Steel I & II** (x86) 
 * **The Legend of Heroes: Trails of Cold Steel III & IV**
 * **The Legend of Heroes: Trails into Reverie**
 * **The Legend of Nayuta: Boundless Trails**
-* **Ys: Memories of Celceta**
+* **Ys: Memories of Celceta** (x86)
 * **Ys VIII: Lacrimosa of DANA**
 * **Ys IX: Monstrum Nox**
 
 ### Retro (DirectX 9)
-* **Xanadu Next** (Requires Wrapper)
+* **Xanadu Next** (Requires D8toD9 Wrapper, included in install)
 * **Ys SEVEN**
 * **Ys Origin**
 * **Ys: The Oath in Felghana**
