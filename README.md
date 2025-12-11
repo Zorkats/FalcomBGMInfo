@@ -45,9 +45,14 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 ### Steam Deck / Linux (Proton)
 
 1.  Follow the **Windows** installation steps above (copy files to the game folder).
-2.  In your Steam Library, right-click the game and select **Properties**.
-3.  In the **General** tab, find **Launch Options**.
-4.  Add the following command to force the mod to load:
+2.  Rename the winmm.dll to one of the following names:
+- xinput1_4.dll: For Trails in the Sky the 1st.
+- dinput8.dll: For most games (needs testing yet).
+- winmm.dll: For some games (needs testing yet).
+- version.dll: For a few games (needs testing yet).
+3.  In your Steam Library, right-click the game and select **Properties**.
+4.  In the **General** tab, find **Launch Options**.
+5.  Add the following command to force the mod to load:
 
     **For most games:**
     ```bash
