@@ -38,7 +38,7 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
     * **Retro_DX9.zip**: For Xanadu Next, Ys Origin, Ys 6/7, Sky FC (Original).
 2.  Open your game's installation folder (where the game's `.exe` is located).
 3.  **Extract all files** from the zip into the game directory.
-    * This should include `winmm.dll`, the `.asi` file, and the `assets/` folder.
+    * This should include `winmm.dll`, and the `assets/` folder.
     * **For Xanadu Next users:** Ensure `d3d8.dll` is also extracted.
 4.  Launch the game. The mod will automatically detect the game and load the correct music map.
 
