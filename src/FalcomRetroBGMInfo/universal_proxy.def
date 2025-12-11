@@ -1,0 +1,77 @@
+EXPORTS
+    ; ----- XINPUT1_4.DLL -----
+    XInputGetState = Proxy_XInputGetState                               @2
+    XInputSetState = Proxy_XInputSetState                               @3
+    XInputGetCapabilities = Proxy_XInputGetCapabilities                 @4
+    XInputEnable = Proxy_XInputEnable                                   @5
+    XInputGetAudioDeviceIds = Proxy_XInputGetAudioDeviceIds             @6
+    XInputGetBatteryInformation = Proxy_XInputGetBatteryInformation     @7
+    XInputGetKeystroke = Proxy_XInputGetKeystroke                       @8
+    XInputGetDSoundAudioDeviceGuids = Proxy_XInputGetDSoundAudioDeviceGuids @1
+
+    ; ----- VERSION.DLL -----
+    GetFileVersionInfoA = Proxy_GetFileVersionInfoA
+    GetFileVersionInfoW = Proxy_GetFileVersionInfoW
+    GetFileVersionInfoExA = Proxy_GetFileVersionInfoExA
+    GetFileVersionInfoExW = Proxy_GetFileVersionInfoExW
+    GetFileVersionInfoSizeA = Proxy_GetFileVersionInfoSizeA
+    GetFileVersionInfoSizeW = Proxy_GetFileVersionInfoSizeW
+    GetFileVersionInfoSizeExA = Proxy_GetFileVersionInfoSizeExA
+    GetFileVersionInfoSizeExW = Proxy_GetFileVersionInfoSizeExW
+    VerQueryValueA = Proxy_VerQueryValueA
+    VerQueryValueW = Proxy_VerQueryValueW
+    VerFindFileA = Proxy_VerFindFileA
+    VerFindFileW = Proxy_VerFindFileW
+    VerInstallFileA = Proxy_VerInstallFileA
+    VerInstallFileW = Proxy_VerInstallFileW
+    VerLanguageNameA = Proxy_VerLanguageNameA
+    VerLanguageNameW = Proxy_VerLanguageNameW
+
+    ; ----- DINPUT8.DLL -----
+    DirectInput8Create = Proxy_DirectInput8Create
+    DllCanUnloadNow = Proxy_DInput_DllCanUnloadNow                      PRIVATE
+    DllGetClassObject = Proxy_DInput_DllGetClassObject                  PRIVATE
+    DllRegisterServer = Proxy_DInput_DllRegisterServer                  PRIVATE
+    DllUnregisterServer = Proxy_DInput_DllUnregisterServer              PRIVATE
+
+    ; ----- WINMM.DLL -----
+    timeGetTime = Proxy_timeGetTime
+    timeBeginPeriod = Proxy_timeBeginPeriod
+    timeEndPeriod = Proxy_timeEndPeriod
+    timeGetDevCaps = Proxy_timeGetDevCaps
+    timeSetEvent = Proxy_timeSetEvent
+    timeKillEvent = Proxy_timeKillEvent
+    timeGetSystemTime = Proxy_timeGetSystemTime
+    PlaySoundA = Proxy_PlaySoundA
+    PlaySoundW = Proxy_PlaySoundW
+    sndPlaySoundA = Proxy_sndPlaySoundA
+    sndPlaySoundW = Proxy_sndPlaySoundW
+    waveOutGetNumDevs = Proxy_waveOutGetNumDevs
+    waveOutOpen = Proxy_waveOutOpen
+    waveOutClose = Proxy_waveOutClose
+    waveOutPrepareHeader = Proxy_waveOutPrepareHeader
+    waveOutUnprepareHeader = Proxy_waveOutUnprepareHeader
+    waveOutWrite = Proxy_waveOutWrite
+    waveOutPause = Proxy_waveOutPause
+    waveOutRestart = Proxy_waveOutRestart
+    waveOutReset = Proxy_waveOutReset
+    waveOutBreakLoop = Proxy_waveOutBreakLoop
+    waveOutGetPosition = Proxy_waveOutGetPosition
+    waveOutGetPitch = Proxy_waveOutGetPitch
+    waveOutSetPitch = Proxy_waveOutSetPitch
+    waveOutGetPlaybackRate = Proxy_waveOutGetPlaybackRate
+    waveOutSetPlaybackRate = Proxy_waveOutSetPlaybackRate
+    waveOutGetVolume = Proxy_waveOutGetVolume
+    waveOutSetVolume = Proxy_waveOutSetVolume
+    waveOutGetID = Proxy_waveOutGetID
+    waveOutMessage = Proxy_waveOutMessage
+    waveOutGetDevCapsA = Proxy_waveOutGetDevCapsA
+    waveOutGetDevCapsW = Proxy_waveOutGetDevCapsW
+    waveOutGetErrorTextA = Proxy_waveOutGetErrorTextA
+    waveOutGetErrorTextW = Proxy_waveOutGetErrorTextW
+    mciSendCommandA = Proxy_mciSendCommandA
+    mciSendCommandW = Proxy_mciSendCommandW
+    mciSendStringA = Proxy_mciSendStringA
+    mciSendStringW = Proxy_mciSendStringW
+    mciGetErrorStringA = Proxy_mciGetErrorStringA
+    mciGetErrorStringW = Proxy_mciGetErrorStringW

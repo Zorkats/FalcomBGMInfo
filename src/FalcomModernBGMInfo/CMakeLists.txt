@@ -14,10 +14,12 @@ find_package(minhook CONFIG REQUIRED)
 find_package(directx-headers CONFIG REQUIRED)
 find_package(directxtk CONFIG REQUIRED)
 
+
 # --- Define Your DLL Target ---
 add_library(FalcomModernBGMInfo SHARED
         main_dx11.cpp
-
+        universal_proxy.def
+        universal_proxy.h
         # --- ImGui Source Files ---
         # We must compile ALL ImGui source files, not just the backends
         # This will resolve all LNK2019 errors.

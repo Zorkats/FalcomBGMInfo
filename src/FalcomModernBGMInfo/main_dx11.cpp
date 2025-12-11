@@ -3,12 +3,11 @@
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #include <psapi.h>
-
+#include "universal_proxy.h"
 #include <d3d11.h>
 #pragma comment(lib, "d3d11.lib")
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
-#pragma comment(lib, "dxguid.lib")
 
 #include <MinHook.h>
 
@@ -400,9 +399,26 @@ LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 void InitImGui(IDXGISwapChain* pSwapChain) {
     if (g_imguiInitialized) return;
 
-    Log("InitImGui called.");
+    Log("InitImGui starting...");
+
+    // Get window from swap chain if we don't have one
+    if (!g_hWindow) {
+        DXGI_SWAP_CHAIN_DESC desc;
+        if (SUCCEEDED(pSwapChain->GetDesc(&desc))) {
+            g_hWindow = desc.OutputWindow;
+            Log("Window from swap chain GetDesc: " + std::to_string((uintptr_t)g_hWindow));
+        }
+    }
+
+    if (!g_hWindow) {
+        Log("ERROR: No valid window handle, skipping initialization");
+        return;
+    }
+
+    Log("Using window handle: " + std::to_string((uintptr_t)g_hWindow));
 
     if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_pd3dDevice))) {
+        Log("Got D3D11 device successfully");
         g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
         g_pfnOriginalWndProc = (WNDPROC)SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
 
@@ -453,10 +469,12 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
 }
 
 HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
-    static bool s_bFirstTime = true;
-    if (s_bFirstTime) {
-        Log("My_Present hook has been called!");
-        s_bFirstTime = false;
+    static int frameCount = 0;
+    frameCount++;
+
+    // Log first few frames to confirm Present is being called
+    if (frameCount <= 3) {
+        Log("Present called, frame " + std::to_string(frameCount));
     }
 
     D3D11StateSaver stateSaver(g_pd3dDeviceContext);
@@ -618,6 +636,14 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         if (fontPushed) ImGui::PopFont();
     }
 
+    // Debug: Log rendering state periodically
+    static int renderLogCounter = 0;
+    if (g_toastTimer > 0.0f && renderLogCounter++ % 60 == 0) {
+        Log("Rendering toast: X=" + std::to_string(g_toastCurrentX) +
+            " Timer=" + std::to_string(g_toastTimer) +
+            " Display=" + std::to_string(io.DisplaySize.x) + "x" + std::to_string(io.DisplaySize.y));
+    }
+
     ImGui::Render();
 
     ID3D11RenderTargetView* pRTV = nullptr;
@@ -748,6 +774,7 @@ void ProcessBgmTrigger(const std::string& s_filename) {
                 g_toastTimer = TOAST_DURATION_SECONDS;
                 g_songLastShown[songKey] = std::chrono::steady_clock::now();
                 g_toastCurrentX = -10000.0f;
+                Log("TOAST TRIGGERED: " + g_currentBgmInfo.songName + " | ImGui initialized: " + (g_imguiInitialized ? "YES" : "NO"));
             }
             break;
         }
@@ -817,27 +844,17 @@ void InitializeHooks() {
         Log("CoInitializeEx successful.");
     }
 
-    while (g_hWindow == NULL) {
-        if (!g_Config.windowTitlePart.empty()) {
-            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
-                char title[256];
-                GetWindowTextA(hwnd, title, 256);
-                if (std::string(title).find(g_Config.windowTitlePart) != std::string::npos) {
-                    g_hWindow = hwnd;
-                    return FALSE;
-                }
-                return TRUE;
-            }, 0);
-        }
-        if (!g_hWindow) {
-            Log("Searching for " + g_Config.gameName + " window...");
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
+    // Don't block for window here - we'll get it from the swap chain in InitImGui
+    // Create a temporary window for vtable discovery
+    HWND hTempWnd = CreateWindowExA(0, "STATIC", "TempD3D11Window", 0, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
+    if (!hTempWnd) {
+        Log("Failed to create temporary window for hook discovery");
+        return;
     }
-    Log(g_Config.gameName + " window found!");
 
     if (MH_Initialize() != MH_OK) {
         Log("MH_Initialize failed!");
+        DestroyWindow(hTempWnd);
         return;
     }
     Log("MH_Initialize successful.");
@@ -875,7 +892,9 @@ void InitializeHooks() {
         }
     }
 
-    uintptr_t pPresentAddr = FindPresentAddress(g_hWindow);
+    uintptr_t pPresentAddr = FindPresentAddress(hTempWnd);
+    DestroyWindow(hTempWnd);  // Done with temp window
+
     if (pPresentAddr) {
         std::stringstream ss;
         ss << "FindPresentAddress successful. Found at: 0x" << std::hex << pPresentAddr;
@@ -902,34 +921,13 @@ void InitializeHooks() {
 BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        DetectProxyType(hModule);
         std::thread(InitializeHooks).detach();
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
-        Log("--- DLL_PROCESS_DETACH ---");
-
+        // Minimal cleanup only - full cleanup causes hanging in some games
         g_bWorkerThreadActive = false;
-        if (g_workerThread.joinable()) {
-            g_workerThread.join();
-            Log("BGM Worker Thread joined.");
-        }
-
-        if (g_imguiInitialized) {
-            SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)g_pfnOriginalWndProc);
-            ImGui_ImplDX11_Shutdown();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-        }
-
-        if (g_pToastTexture) {
-            g_pToastTexture->Release();
-            g_pToastTexture = nullptr;
-        }
-        if (g_pToastResource) {
-            g_pToastResource->Release();
-            g_pToastResource = nullptr;
-        }
-
-        MH_Uninitialize();
+        // Don't join thread or release resources - let OS handle it
     }
 
     return TRUE;

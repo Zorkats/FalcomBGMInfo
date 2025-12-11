@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
+#include "universal_proxy.h"
 
 #include <d3d9.h>
 #pragma comment(lib, "d3d9.lib")
@@ -25,6 +26,7 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include "imgui_impl_dx9.h"
+
 
 // =============================================================
 // CONFIGURATION SYSTEM
@@ -320,22 +322,24 @@ void LoadDdsTexture(IDirect3DDevice9* pDevice) {
 void InitImGui(IDirect3DDevice9* pDevice) {
     if (g_imguiInitialized) return;
 
+    Log("InitImGui starting...");
+
     // Ensure we have a valid window handle
     if (!g_hWindow) {
         // Try to get window from device creation parameters
         D3DDEVICE_CREATION_PARAMETERS params;
         if (SUCCEEDED(pDevice->GetCreationParameters(&params))) {
             g_hWindow = params.hFocusWindow;
-            Log("Window obtained from device creation params: " + std::to_string((uintptr_t)g_hWindow));
+            Log("Window from GetCreationParameters: " + std::to_string((uintptr_t)g_hWindow));
         }
     }
 
     if (!g_hWindow) {
-        Log("InitImGui: No valid window handle, skipping initialization");
+        Log("ERROR: No valid window handle, skipping initialization");
         return;
     }
 
-    Log("InitImGui called.");
+    Log("Using window handle: " + std::to_string((uintptr_t)g_hWindow));
 
     g_pfnOriginalWndProc = (WNDPROC)SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
     ImGui::CreateContext();
@@ -388,6 +392,14 @@ void InitImGui(IDirect3DDevice9* pDevice) {
 }
 
 HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
+    static int frameCount = 0;
+    frameCount++;
+
+    // Log first few frames to confirm EndScene is being called
+    if (frameCount <= 3) {
+        Log("EndScene called, frame " + std::to_string(frameCount));
+    }
+
     InitImGui(pDevice);
 
     ImGui_ImplDX9_NewFrame();
@@ -549,6 +561,14 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
         if (fontPushed) ImGui::PopFont();
     }
 
+    // Debug: Log rendering state periodically
+    static int renderLogCounter = 0;
+    if (g_toastTimer > 0.0f && renderLogCounter++ % 60 == 0) {
+        Log("Rendering toast: X=" + std::to_string(g_toastCurrentX) +
+            " Timer=" + std::to_string(g_toastTimer) +
+            " Display=" + std::to_string(io.DisplaySize.x) + "x" + std::to_string(io.DisplaySize.y));
+    }
+
     ImGui::EndFrame();
     ImGui::Render();
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
@@ -625,6 +645,7 @@ void TriggerToast(const BgmInfo& info) {
         g_toastTimer = TOAST_DURATION_SECONDS;
         g_toastCurrentX = -10000.0f;
         g_songLastShown[songKey] = std::chrono::steady_clock::now();
+        Log("TOAST TRIGGERED: " + info.songName + " | ImGui initialized: " + (g_imguiInitialized ? "YES" : "NO"));
     }
 }
 
@@ -896,12 +917,14 @@ void InitializeMod() {
 BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        DetectProxyType(hModule);
         InitializeMod();
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
         // Minimal cleanup only - full cleanup causes hanging in some games
         // (Ys: The Oath in Felghana, Xanadu Next, etc.)
         g_bWorkerThreadActive = false;
+        // Don't join thread or release resources - let OS handle it
     }
 
     return TRUE;

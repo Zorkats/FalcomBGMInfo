@@ -17,6 +17,8 @@ find_package(dxsdk-d3dx CONFIG REQUIRED)
 # --- Define Your DLL Target ---
 add_library(FalcomRetroBGMInfo SHARED
         main_dx9.cpp
+        universal_proxy.def
+        universal_proxy.h
 
         # --- ImGui Source Files ---
         # We must compile ALL ImGui source files, not just the backends
