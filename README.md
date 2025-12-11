@@ -52,16 +52,16 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 - version.dll: For a few games (needs testing yet).
 3.  In your Steam Library, right-click the game and select **Properties**.
 4.  In the **General** tab, find **Launch Options**.
-5.  Add the following command to force the mod to load:
+5.  Add the following command to force the mod to load: (Remember to put your .dll name!)
 
     **For most games:**
     ```bash
-    WINEDLLOVERRIDES="winmm=n,b" %command%
+    WINEDLLOVERRIDES="yourdllnamehere=n,b" %command%
     ```
 
     **For Xanadu Next ONLY:**
     ```bash
-    WINEDLLOVERRIDES="winmm,d3d8=n,b" %command%
+    WINEDLLOVERRIDES="yourdllnamehere,d3d8=n,b" %command%
     ```
 
 ---
