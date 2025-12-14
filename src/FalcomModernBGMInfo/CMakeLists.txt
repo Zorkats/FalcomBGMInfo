@@ -7,6 +7,34 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
+# =========================================================
+# ARCHITECTURE DETECTION & CONFIGURATION
+# =========================================================
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(STATUS "Configuring for x64 (64-bit)")
+
+    # 1. Select x64 Source Files
+    set(PROXY_SOURCES
+            universal_proxy_x64.cpp
+            universal_proxy_x64.h
+    )
+
+    # 2. Select x64 Definition File
+    set(PROXY_DEF universal_proxy_x64.def)
+
+else()
+    message(STATUS "Configuring for x86 (32-bit)")
+
+
+    # 1. Select x86 Source Files
+    set(PROXY_SOURCES
+            universal_proxy_x86.cpp
+            universal_proxy_x86.h
+    )
+
+    # 2. Select x86 Definition File
+    set(PROXY_DEF universal_proxy_x86.def)
+endif()
 
 # --- vcpkg Package Finding ---
 find_package(yaml-cpp CONFIG REQUIRED)
@@ -14,37 +42,37 @@ find_package(minhook CONFIG REQUIRED)
 find_package(directx-headers CONFIG REQUIRED)
 find_package(directxtk CONFIG REQUIRED)
 
-
 # --- Define Your DLL Target ---
 add_library(FalcomModernBGMInfo SHARED
         main_dx11.cpp
-        universal_proxy.def
-        universal_proxy.h
+        ${PROXY_SOURCES}  # <--- Only adds the files for the current architecture
+
         # --- ImGui Source Files ---
-        # We must compile ALL ImGui source files, not just the backends
-        # This will resolve all LNK2019 errors.
         "../include/imgui/imgui.cpp"
         "../include/imgui/imgui_draw.cpp"
         "../include/imgui/imgui_tables.cpp"
         "../include/imgui/imgui_widgets.cpp"
 
-        # The backends you already had
         "../include/imgui/backends/imgui_impl_dx11.cpp"
         "../include/imgui/backends/imgui_impl_win32.cpp"
 )
+
+# --- Link the specific Definition File ---
+target_sources(FalcomModernBGMInfo PRIVATE ${PROXY_DEF})
+
 target_include_directories(FalcomModernBGMInfo PRIVATE
         ../include
         "../include/imgui"
 )
+
 # --- Link All Libraries ---
 target_link_libraries(FalcomModernBGMInfo PRIVATE
-        # vcpkg-managed libraries
         yaml-cpp::yaml-cpp
         minhook::minhook
         Microsoft::DirectX-Headers
         Microsoft::DirectXTK
 
-        # Windows system libraries
         shlwapi
         d3d11
+        winmm
 )

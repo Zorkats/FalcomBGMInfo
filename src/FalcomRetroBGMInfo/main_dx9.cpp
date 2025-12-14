@@ -2,7 +2,7 @@
 #include <windows.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
-#include "universal_proxy.h"
+#include "universal_proxy_x86.h"
 
 #include <d3d9.h>
 #pragma comment(lib, "d3d9.lib")

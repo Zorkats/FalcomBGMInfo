@@ -3,7 +3,7 @@
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #include <psapi.h>
-#include "universal_proxy.h"
+#include "universal_proxy_x64.h"
 #include <d3d11.h>
 #pragma comment(lib, "d3d11.lib")
 #include <DDSTextureLoader.h>

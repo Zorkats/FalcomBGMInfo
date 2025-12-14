@@ -17,12 +17,13 @@ find_package(dxsdk-d3dx CONFIG REQUIRED)
 # --- Define Your DLL Target ---
 add_library(FalcomRetroBGMInfo SHARED
         main_dx9.cpp
-        universal_proxy.def
-        universal_proxy.h
+
+        # Use the x86-specific proxy implementation
+        universal_proxy_x86.cpp
+        universal_proxy_x86.h
+        universal_proxy_x86.def
 
         # --- ImGui Source Files ---
-        # We must compile ALL ImGui source files, not just the backends
-        # This will resolve all LNK2019 errors.
         "../include/imgui/imgui.cpp"
         "../include/imgui/imgui_draw.cpp"
         "../include/imgui/imgui_tables.cpp"
@@ -33,11 +34,13 @@ add_library(FalcomRetroBGMInfo SHARED
         "../include/imgui/backends/imgui_impl_dx9.cpp"
         "../include/imgui/backends/imgui_impl_win32.cpp"
 )
+
 target_include_directories(FalcomRetroBGMInfo PRIVATE
         ../include
         "../include/imgui"
         "../include/imgui/backends"
 )
+
 # --- Link All Libraries ---
 target_link_libraries(FalcomRetroBGMInfo PRIVATE
         # vcpkg-managed libraries
@@ -52,4 +55,5 @@ target_link_libraries(FalcomRetroBGMInfo PRIVATE
         # Windows system libraries
         shlwapi
         d3d11
+        winmm
 )
