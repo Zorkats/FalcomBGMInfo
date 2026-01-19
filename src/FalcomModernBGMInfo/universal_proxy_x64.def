@@ -244,3 +244,13 @@ EXPORTS
     waveOutWrite = Proxy_waveOutWrite
     wid32Message = Proxy_wid32Message
     wod32Message = Proxy_wod32Message
+
+    ; -------------------------------------------------------------------------
+    ; DXGI.DLL
+    ; -------------------------------------------------------------------------
+    CreateDXGIFactory = Proxy_CreateDXGIFactory
+    CreateDXGIFactory1 = Proxy_CreateDXGIFactory1
+    CreateDXGIFactory2 = Proxy_CreateDXGIFactory2
+    DXGIGetDebugInterface1 = Proxy_DXGIGetDebugInterface1
+    DXGIDeclareAdapterRemovalSupport = Proxy_DXGIDeclareAdapterRemovalSupport
+    DXGIDisableVBlankVirtualization = Proxy_DXGIDisableVBlankVirtualization

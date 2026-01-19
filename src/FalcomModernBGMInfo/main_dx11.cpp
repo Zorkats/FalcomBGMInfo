@@ -170,7 +170,7 @@ void DetectAndConfigure() {
             g_Config.gameName = "Trails in the Sky (Remake)";
             g_Config.windowTitlePart = "Trails in the Sky";
             g_Config.yamlFiles.push_back("BgmMap_Sky.yaml");
-            g_Config.soundManagerRVA = 0x576D60;
+            g_Config.useWav = true;
             break;
         default:
             g_Config.gameName = "Unknown Game";
@@ -392,7 +392,9 @@ static WNDPROC g_pfnOriginalWndProc = NULL;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam)) return TRUE;
+    // Let ImGui process for internal state, but ALWAYS pass to game
+    // This is a non-interactive overlay - never block input
+    ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
 }
 
@@ -425,6 +427,10 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = NULL;
+
+        // Disable all input capture - this is a non-interactive overlay
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+        io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
 
         std::string f1 = GetModDirectory() + "\\assets/mod_font.otf";
         std::string f2 = GetModDirectory() + "\\assets/mod_font_japanese.ttf";
@@ -833,6 +839,14 @@ uintptr_t FindPresentAddress(HWND hWnd) {
 }
 
 void InitializeHooks() {
+    // Guard against multiple initializations
+    static bool s_bInitialized = false;
+    if (s_bInitialized) {
+        Log("InitializeHooks already called, skipping duplicate initialization.");
+        return;
+    }
+    s_bInitialized = true;
+
     Log("Hook thread started.");
 
     DetectAndConfigure();
@@ -852,8 +866,9 @@ void InitializeHooks() {
         return;
     }
 
-    if (MH_Initialize() != MH_OK) {
-        Log("MH_Initialize failed!");
+    MH_STATUS mhStatus = MH_Initialize();
+    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("MH_Initialize failed with status: " + std::to_string(mhStatus));
         DestroyWindow(hTempWnd);
         return;
     }

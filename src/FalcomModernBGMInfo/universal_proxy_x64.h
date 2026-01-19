@@ -242,4 +242,12 @@ extern "C" {
     extern FARPROC g_pfnwaveOutWrite;
     extern FARPROC g_pfnwid32Message;
     extern FARPROC g_pfnwod32Message;
+
+    // DXGI
+    extern FARPROC g_pfnCreateDXGIFactory;
+    extern FARPROC g_pfnCreateDXGIFactory1;
+    extern FARPROC g_pfnCreateDXGIFactory2;
+    extern FARPROC g_pfnDXGIGetDebugInterface1;
+    extern FARPROC g_pfnDXGIDeclareAdapterRemovalSupport;
+    extern FARPROC g_pfnDXGIDisableVBlankVirtualization;
 }

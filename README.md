@@ -20,12 +20,15 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 * **Ys IX: Monstrum Nox**
 
 ### Retro (DirectX 9)
-* **Xanadu Next** (Requires Wrapper)
+* **Xanadu Next** (Requires renaming to version.dll and DX9 Wrapper, attached on release)
 * **Ys SEVEN**
 * **Ys Origin**
 * **Ys: The Oath in Felghana**
 * **Ys VI: The Ark of Napishtim**
 * **The Legend of Heroes: Trails in the Sky FC** (Original DX9 Version)
+* **The Legend of Heroes: Trails in the Sky SC** (Original DX9 Version)
+* **The Legend of Heroes: Trails in the Sky the 3rd** (Original DX9 Version)
+* **Zwei II** (soon!)
 
 ---
 

@@ -6,7 +6,7 @@
 // GLOBAL VARIABLES (Definitions)
 // =============================================================
 HMODULE g_hOriginalDll = nullptr;
-enum class ProxyType { None, XInput, Version, DInput8, WinMM };
+enum class ProxyType { None, XInput, Version, DInput8, WinMM, DXGI };
 ProxyType g_ProxyType = ProxyType::None;
 
 // Function Pointers - Defined
@@ -246,6 +246,14 @@ extern "C" {
     FARPROC g_pfnwaveOutWrite = nullptr;
     FARPROC g_pfnwid32Message = nullptr;
     FARPROC g_pfnwod32Message = nullptr;
+
+    // DXGI
+    FARPROC g_pfnCreateDXGIFactory = nullptr;
+    FARPROC g_pfnCreateDXGIFactory1 = nullptr;
+    FARPROC g_pfnCreateDXGIFactory2 = nullptr;
+    FARPROC g_pfnDXGIGetDebugInterface1 = nullptr;
+    FARPROC g_pfnDXGIDeclareAdapterRemovalSupport = nullptr;
+    FARPROC g_pfnDXGIDisableVBlankVirtualization = nullptr;
 }
 
 // =============================================================
@@ -281,7 +289,16 @@ void LoadOriginalDll() {
             g_hOriginalDll = LoadLibraryA(path);
             break;
         case ProxyType::WinMM:
+            sprintf_s(path, "%s\\winmm.dll", systemPath);
+            g_hOriginalDll = LoadLibraryA(path);
+            break;
+        case ProxyType::DXGI:
+            sprintf_s(path, "%s\\dxgi.dll", systemPath);
+            g_hOriginalDll = LoadLibraryA(path);
+            break;
+        case ProxyType::None:
         default:
+            // Fallback to WinMM
             sprintf_s(path, "%s\\winmm.dll", systemPath);
             g_hOriginalDll = LoadLibraryA(path);
             break;
@@ -333,6 +350,14 @@ void LoadOriginalDll() {
         if (!g_pfnXInputWaitForGuideButton) g_pfnXInputWaitForGuideButton = GetProcAddress(g_hOriginalDll, (LPCSTR)101);
         if (!g_pfnXInputCancelGuideButtonWait) g_pfnXInputCancelGuideButtonWait = GetProcAddress(g_hOriginalDll, (LPCSTR)102);
         if (!g_pfnXInputPowerOffController) g_pfnXInputPowerOffController = GetProcAddress(g_hOriginalDll, (LPCSTR)103);
+    }
+    else if (g_ProxyType == ProxyType::DXGI) {
+        LOAD_PROC(CreateDXGIFactory);
+        LOAD_PROC(CreateDXGIFactory1);
+        LOAD_PROC(CreateDXGIFactory2);
+        LOAD_PROC(DXGIGetDebugInterface1);
+        LOAD_PROC(DXGIDeclareAdapterRemovalSupport);
+        LOAD_PROC(DXGIDisableVBlankVirtualization);
     }
     else { // WinMM
         LOAD_PROC(CloseDriver);
@@ -543,6 +568,7 @@ void DetectProxyType(HMODULE hModule) {
     else if (strstr(lower, "version")) g_ProxyType = ProxyType::Version;
     else if (strstr(lower, "dinput8")) g_ProxyType = ProxyType::DInput8;
     else if (strstr(lower, "winmm")) g_ProxyType = ProxyType::WinMM;
+    else if (strstr(lower, "dxgi")) g_ProxyType = ProxyType::DXGI;
     else g_ProxyType = ProxyType::WinMM;
 
     LoadOriginalDll();
@@ -805,3 +831,13 @@ PROXY_IMPL(MMRESULT, waveOutUnprepareHeader, (HWAVEOUT hwo, LPWAVEHDR pwh, UINT 
 PROXY_IMPL(MMRESULT, waveOutWrite, (HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh), (hwo, pwh, cbwh), (HWAVEOUT, LPWAVEHDR, UINT))
 PROXY_IMPL(UINT, wid32Message, (UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dwParam1, DWORD_PTR dwParam2), (uDeviceID, uMsg, dwUser, dwParam1, dwParam2), (UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR))
 PROXY_IMPL(UINT, wod32Message, (UINT uDeviceID, UINT uMsg, DWORD_PTR dwUser, DWORD_PTR dwParam1, DWORD_PTR dwParam2), (uDeviceID, uMsg, dwUser, dwParam1, dwParam2), (UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR))
+
+// =============================================================
+// DXGI PROXY WRAPPERS
+// =============================================================
+PROXY_IMPL(HRESULT, CreateDXGIFactory, (REFIID riid, void** ppFactory), (riid, ppFactory), (REFIID, void**))
+PROXY_IMPL(HRESULT, CreateDXGIFactory1, (REFIID riid, void** ppFactory), (riid, ppFactory), (REFIID, void**))
+PROXY_IMPL(HRESULT, CreateDXGIFactory2, (UINT Flags, REFIID riid, void** ppFactory), (Flags, riid, ppFactory), (UINT, REFIID, void**))
+PROXY_IMPL(HRESULT, DXGIGetDebugInterface1, (UINT Flags, REFIID riid, void** pDebug), (Flags, riid, pDebug), (UINT, REFIID, void**))
+PROXY_IMPL(HRESULT, DXGIDeclareAdapterRemovalSupport, (), (), ())
+PROXY_IMPL(HRESULT, DXGIDisableVBlankVirtualization, (), (), ())

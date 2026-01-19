@@ -292,7 +292,9 @@ static WNDPROC g_pfnOriginalWndProc = NULL;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam)) return TRUE;
+    // Let ImGui process for internal state, but ALWAYS pass to game
+    // This is a non-interactive overlay - never block input
+    ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
 }
 
@@ -345,6 +347,10 @@ void InitImGui(IDirect3DDevice9* pDevice) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+
+    // Disable all input capture - this is a non-interactive overlay
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
 
     const std::string fontPathStr = GetModDirectory() + "\\assets/mod_font.otf";
     const std::string fontPathJapaneseStr = GetModDirectory() + "\\assets/mod_font_japanese.ttf";
@@ -889,10 +895,19 @@ IDirect3D9* WINAPI Detour_Direct3DCreate9(UINT SDKVersion) {
 }
 
 void InitializeMod() {
+    // Guard against multiple initializations (some games load the proxy DLL multiple times)
+    static bool s_bInitialized = false;
+    if (s_bInitialized) {
+        Log("InitializeMod already called, skipping duplicate initialization.");
+        return;
+    }
+    s_bInitialized = true;
+
     DetectAndConfigure();
 
-    if (MH_Initialize() != MH_OK) {
-        Log("MH_Initialize failed!");
+    MH_STATUS mhStatus = MH_Initialize();
+    if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("MH_Initialize failed with status: " + std::to_string(mhStatus));
         return;
     }
     Log("MH_Initialize successful.");
