@@ -534,7 +534,7 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     if (g_toastCurrentX != -10000.0f) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         ImVec2 p_box(g_toastCurrentX + g_currentNoteIconWidth, SCREEN_PADDING);
-        dl->AddRectFilled(p_box, ImVec2(p_box.x + g_currentBoxWidth, SCREEN_PADDING + g_currentToastTotalHeight), IM_COL32(0, 0, 0, 180), ROUNDING);
+        dl->AddRectFilled(p_box, ImVec2(p_box.x + g_currentBoxWidth, SCREEN_PADDING + g_currentToastTotalHeight), IM_COL32(0, 0, 0, 140), ROUNDING);
 
         if (g_pToastTexture) {
             dl->AddImage((void*)g_pToastTexture,
@@ -577,7 +577,29 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
 
     ImGui::EndFrame();
     ImGui::Render();
+
+    // Save ALL device state - this ensures game state is perfectly preserved
+    IDirect3DStateBlock9* pStateBlock = nullptr;
+    pDevice->CreateStateBlock(D3DSBT_ALL, &pStateBlock);
+
+    // Get and set the backbuffer as render target explicitly
+    IDirect3DSurface9* pRenderBackBuffer = nullptr;
+    if (SUCCEEDED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pRenderBackBuffer))) {
+        pDevice->SetRenderTarget(0, pRenderBackBuffer);
+        pRenderBackBuffer->Release();
+    }
+
+    // Disable SRGB write which can mess with alpha blending
+    pDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+
+    // Restore ALL device state (including render target)
+    if (pStateBlock) {
+        pStateBlock->Apply();
+        pStateBlock->Release();
+    }
+
     return g_pfnOriginalEndScene(pDevice);
 }
 

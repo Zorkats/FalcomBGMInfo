@@ -170,7 +170,7 @@ void DetectAndConfigure() {
             g_Config.gameName = "Trails in the Sky (Remake)";
             g_Config.windowTitlePart = "Trails in the Sky";
             g_Config.yamlFiles.push_back("BgmMap_Sky.yaml");
-            g_Config.useWav = true;
+            g_Config.soundManagerRVA = 0x57B440;
             break;
         default:
             g_Config.gameName = "Unknown Game";
