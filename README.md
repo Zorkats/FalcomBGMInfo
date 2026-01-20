@@ -1,5 +1,9 @@
 # Falcom BGM Info
 
+![start line](https://github.com/user-attachments/assets/8645dda1-53bf-4c15-8449-f5d908a0de35)
+![shine of aidios](https://github.com/user-attachments/assets/7c868ce3-7f4a-4cd3-9266-32a9c6c93d00)
+
+
 ## Introduction
 **Falcom BGM Info** is a quality-of-life mod for various Nihon Falcom games on PC. It displays an unobtrusive "Toast" notification at the top of the screen whenever the background music changes, showing the **Song Title**, **Japanese Title**, **Album**, and **Disc/Track number**, similar to how the newer PH3 Ports (Ys X: Nordics, and the Calvard Arc Trails games) do.
 
@@ -49,10 +53,10 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 
 1.  Follow the **Windows** installation steps above (copy files to the game folder).
 2.  Rename the winmm.dll to one of the following names:
-- xinput1_4.dll: For Trails in the Sky the 1st.
-- dinput8.dll: For most games (needs testing yet).
-- winmm.dll: For some games (needs testing yet).
-- version.dll: For a few games (needs testing yet).
+- xinput1_4.dll: For most games, especially Trails in the Sky the 1st.
+- dinput8.dll: For most games.
+- winmm.dll: For most games.
+- version.dll: For Xanadu Next.
 3.  In your Steam Library, right-click the game and select **Properties**.
 4.  In the **General** tab, find **Launch Options**.
 5.  Add the following command to force the mod to load: (Remember to put your .dll name!)
