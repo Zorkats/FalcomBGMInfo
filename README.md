@@ -25,7 +25,7 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 
 ### Retro (DirectX 9)
 * **Xanadu Next** (Requires renaming to version.dll and DX9 Wrapper, attached on release)
-* **Ys SEVEN**
+* **Ys SEVEN** (Requires renaming to xinput1_4.dll, winmm.dll causes missing UI features)
 * **Ys Origin**
 * **Ys: The Oath in Felghana**
 * **Ys VI: The Ark of Napishtim**
