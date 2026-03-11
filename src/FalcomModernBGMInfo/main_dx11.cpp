@@ -49,12 +49,23 @@ struct GameConfig {
     uintptr_t soundManagerRVA;
 };
 
+struct ModConfig {
+    bool ignoreCooldown = false;
+    int showHotkey = VK_F2;
+    int menuHotkey = VK_F1;
+    float toastDuration = 5.0f;
+    int cooldownHours = 5;
+    bool showJapanese = true;
+    float uiScale = 0.65f;
+};
+
 GameConfig g_Config;
+ModConfig g_ModConfig;
 GameID g_CurrentGame = GameID::Unknown;
 static std::mutex g_LogMutex;
 
 // =============================================================
-// LOGGING
+// LOGGING & UTILS
 // =============================================================
 std::string GetModDirectory() {
     char path[MAX_PATH];
@@ -79,6 +90,68 @@ void Log(const std::string& message) {
 void WCharToString(const WCHAR* wstr, char* buffer, size_t bufferSize) {
     if (!wstr || !buffer) return;
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, buffer, (int)bufferSize, NULL, NULL);
+}
+
+void SaveConfig() {
+    std::string path = GetModDirectory() + "\\mod_config.yaml";
+    try {
+        YAML::Emitter out;
+        out << YAML::BeginMap;
+        out << YAML::Key << "IgnoreCooldown" << YAML::Value << g_ModConfig.ignoreCooldown;
+        out << YAML::Key << "ShowHotkey" << YAML::Value << g_ModConfig.showHotkey;
+        out << YAML::Key << "MenuHotkey" << YAML::Value << g_ModConfig.menuHotkey;
+        out << YAML::Key << "ToastDuration" << YAML::Value << g_ModConfig.toastDuration;
+        out << YAML::Key << "CooldownHours" << YAML::Value << g_ModConfig.cooldownHours;
+        out << YAML::Key << "ShowJapanese" << YAML::Value << g_ModConfig.showJapanese;
+        out << YAML::Key << "UIScale" << YAML::Value << g_ModConfig.uiScale;
+        out << YAML::EndMap;
+        std::ofstream fout(path);
+        fout << out.c_str();
+        Log("Config saved to: " + path);
+    } catch (const std::exception& e) {
+        Log("Failed to save config: " + std::string(e.what()));
+    }
+}
+
+void LoadConfig() {
+    std::string path = GetModDirectory() + "\\mod_config.yaml";
+    std::ifstream fin(path);
+    if (!fin.is_open()) {
+        Log("Config file not found, using defaults.");
+        SaveConfig();
+        return;
+    }
+    try {
+        YAML::Node config = YAML::Load(fin);
+        if (config["IgnoreCooldown"]) g_ModConfig.ignoreCooldown = config["IgnoreCooldown"].as<bool>();
+        if (config["AlwaysShow"]) g_ModConfig.ignoreCooldown = config["AlwaysShow"].as<bool>(); // Legacy support
+        if (config["ShowHotkey"]) g_ModConfig.showHotkey = config["ShowHotkey"].as<int>();
+        if (config["MenuHotkey"]) g_ModConfig.menuHotkey = config["MenuHotkey"].as<int>();
+        if (config["ToastDuration"]) g_ModConfig.toastDuration = config["ToastDuration"].as<float>();
+        if (config["CooldownHours"]) g_ModConfig.cooldownHours = config["CooldownHours"].as<int>();
+        if (config["ShowJapanese"]) g_ModConfig.showJapanese = config["ShowJapanese"].as<bool>();
+        if (config["UIScale"]) g_ModConfig.uiScale = config["UIScale"].as<float>();
+        Log("Config loaded from: " + path);
+    } catch (const std::exception& e) {
+        Log("Failed to load config: " + std::string(e.what()));
+    }
+}
+
+std::string GetKeyName(int vkCode) {
+    if (vkCode == 0) return "None";
+    switch (vkCode) {
+        case VK_LBUTTON: return "Left Mouse"; case VK_RBUTTON: return "Right Mouse";
+        case VK_MBUTTON: return "Middle Mouse"; case VK_BACK: return "Backspace";
+        case VK_TAB: return "Tab"; case VK_RETURN: return "Enter";
+        case VK_ESCAPE: return "Esc"; case VK_SPACE: return "Space";
+    }
+    char name[64];
+    UINT scanCode = MapVirtualKeyA(vkCode, MAPVK_VK_TO_VSC);
+    LONG lParamValue = (scanCode << 16);
+    if ((vkCode >= 33 && vkCode <= 46) || (vkCode >= 91 && vkCode <= 93) || (vkCode >= 106 && vkCode <= 111) || (vkCode >= 144 && vkCode <= 145))
+        lParamValue |= (1 << 24);
+    if (GetKeyNameTextA(lParamValue, name, sizeof(name)) > 0) return std::string(name);
+    std::stringstream ss; ss << "Key: 0x" << std::hex << vkCode; return ss.str();
 }
 
 // =============================================================
@@ -201,17 +274,17 @@ static std::map<std::string, std::chrono::steady_clock::time_point> g_songLastSh
 static std::string g_lastTriggeredFile = "";
 
 static float g_toastTimer = 0.0f;
-constexpr float TOAST_DURATION_SECONDS = 5.0f;
-constexpr int COOLDOWN_HOURS = 5;
 static float g_toastCurrentX = -10000.0f;
 static float g_lastDisplayWidth = 0.0f;
 static float g_lastDisplayHeight = 0.0f;
 
 static bool g_imguiInitialized = false;
+static bool g_showMenu = false;
 static HWND g_hWindow = nullptr;
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static ID3D11RenderTargetView* g_pd3dRenderTargetView = nullptr;
+static ImFont* g_pMenuFont = nullptr;
 static ImFont* g_pToastFont = nullptr;
 static ID3D11ShaderResourceView* g_pToastTexture = nullptr;
 static ID3D11Resource* g_pToastResource = nullptr;
@@ -222,6 +295,47 @@ static std::mutex g_bufferMutex;
 static char g_bgmFilenameBuffer[MAX_PATH];
 static std::atomic<bool> g_bNewBgmAvailable = false;
 static std::atomic<bool> g_bWorkerThreadActive = true;
+
+// =============================================================
+// INPUT BLOCKING DETOURS
+// =============================================================
+typedef SHORT(WINAPI* PFN_GETASYNCKEYSTATE)(int);
+static PFN_GETASYNCKEYSTATE g_pfnOriginalGetAsyncKeyState = nullptr;
+SHORT WINAPI Detour_GetAsyncKeyState(int vKey) {
+    if (g_showMenu) return 0;
+    return g_pfnOriginalGetAsyncKeyState(vKey);
+}
+
+typedef SHORT(WINAPI* PFN_GETKEYSTATE)(int);
+static PFN_GETKEYSTATE g_pfnOriginalGetKeyState = nullptr;
+SHORT WINAPI Detour_GetKeyState(int nVirtKey) {
+    if (g_showMenu) return 0;
+    return g_pfnOriginalGetKeyState(nVirtKey);
+}
+
+typedef BOOL(WINAPI* PFN_GETKEYBOARDSTATE)(PBYTE);
+static PFN_GETKEYBOARDSTATE g_pfnOriginalGetKeyboardState = nullptr;
+BOOL WINAPI Detour_GetKeyboardState(PBYTE lpKeyState) {
+    if (g_showMenu && lpKeyState) {
+        memset(lpKeyState, 0, 256);
+        return TRUE;
+    }
+    return g_pfnOriginalGetKeyboardState(lpKeyState);
+}
+
+typedef BOOL(WINAPI* PFN_SETCURSORPOS)(int, int);
+static PFN_SETCURSORPOS g_pfnOriginalSetCursorPos = nullptr;
+BOOL WINAPI Detour_SetCursorPos(int X, int Y) {
+    if (g_showMenu) return TRUE;
+    return g_pfnOriginalSetCursorPos(X, Y);
+}
+
+typedef BOOL(WINAPI* PFN_CLIPCURSOR)(const RECT*);
+static PFN_CLIPCURSOR g_pfnOriginalClipCursor = nullptr;
+BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
+    if (g_showMenu) return TRUE;
+    return g_pfnOriginalClipCursor(lpRect);
+}
 
 // =============================================================
 // D3D11 STATE SAVER
@@ -345,14 +459,19 @@ void LoadMapFile(const std::string& filename) {
     std::string modDir = GetModDirectory();
     std::string yamlPath = modDir + "\\assets\\" + filename;
     std::ifstream file(yamlPath);
-    if (!file.is_open()) { Log("LoadMapFile: " + filename + " not found."); return; }
+    if (!file.is_open()) {
+        Log("LoadMapFile: " + filename + " not found.");
+        return;
+    }
 
     try {
         YAML::Node config = YAML::Load(file);
         for (const auto& node : config) {
             std::string filepath = node.first.as<std::string>();
             std::string value = node.second.as<std::string>();
-            BgmInfo info; info.rawFileName = filepath;
+            BgmInfo info;
+            info.rawFileName = filepath;
+            
             std::vector<std::string> parts = SplitString(value, '|');
 
             if (g_CurrentGame == GameID::SkyRemake) {
@@ -369,12 +488,13 @@ void LoadMapFile(const std::string& filename) {
                 if (parts.size() >= 5) info.album = parts[4];
             }
 
-            if (info.japaneseName == info.songName) info.japaneseName = "";
-            if (info.japaneseName == " ") info.japaneseName = "";
+            if (info.japaneseName == info.songName || info.japaneseName == " ") info.japaneseName = "";
             g_bgmMap[filepath] = info;
         }
         Log("Loaded: " + filename);
-    } catch (const YAML::Exception& e) { Log("YAML Error: " + std::string(e.what())); }
+    } catch (const YAML::Exception& e) {
+        Log("YAML Error: " + std::string(e.what()));
+    }
 }
 
 void LoadBgmMap() {
@@ -392,9 +512,42 @@ static WNDPROC g_pfnOriginalWndProc = NULL;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Let ImGui process for internal state, but ALWAYS pass to game
-    // This is a non-interactive overlay - never block input
-    ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
+    if (uMsg == WM_KEYDOWN) {
+        if (wParam == g_ModConfig.menuHotkey) {
+            g_showMenu = !g_showMenu;
+            ImGuiIO& io = ImGui::GetIO();
+            if (g_showMenu) {
+                io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+                io.ConfigFlags &= ~ImGuiConfigFlags_NoKeyboard;
+                io.MouseDrawCursor = true;
+            } else {
+                io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+                io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+                io.MouseDrawCursor = false;
+                SaveConfig();
+            }
+            return 0;
+        }
+        if (wParam == g_ModConfig.showHotkey && !g_showMenu) {
+            g_toastTimer = g_ModConfig.toastDuration;
+            g_toastCurrentX = -10000.0f;
+            return 0;
+        }
+    }
+
+    if (g_showMenu) {
+        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
+        // Block mouse and keyboard inputs from reaching the game
+        if ((uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) ||
+            (uMsg >= WM_KEYFIRST && uMsg <= WM_KEYLAST) ||
+            uMsg == WM_INPUT) {
+            return 1;
+        }
+        // Other non-input messages pass through normally
+    } else {
+        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
+    }
+
     return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
 }
 
@@ -403,12 +556,10 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
 
     Log("InitImGui starting...");
 
-    // Get window from swap chain if we don't have one
     if (!g_hWindow) {
         DXGI_SWAP_CHAIN_DESC desc;
         if (SUCCEEDED(pSwapChain->GetDesc(&desc))) {
             g_hWindow = desc.OutputWindow;
-            Log("Window from swap chain GetDesc: " + std::to_string((uintptr_t)g_hWindow));
         }
     }
 
@@ -417,10 +568,7 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
         return;
     }
 
-    Log("Using window handle: " + std::to_string((uintptr_t)g_hWindow));
-
     if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_pd3dDevice))) {
-        Log("Got D3D11 device successfully");
         g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
         g_pfnOriginalWndProc = (WNDPROC)SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
 
@@ -428,29 +576,31 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = NULL;
 
-        // Disable all input capture - this is a non-interactive overlay
         io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
         io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
 
-        std::string f1 = GetModDirectory() + "\\assets/mod_font.otf";
-        std::string f2 = GetModDirectory() + "\\assets/mod_font_japanese.ttf";
-        g_pToastFont = io.Fonts->AddFontFromFileTTF(f1.c_str(), 28.0f);
-        if (g_pToastFont) {
-            Log("mod_font.otf loaded successfully.");
-            ImFontConfig cfg;
-            cfg.MergeMode = true;
-            const ImWchar* ranges = io.Fonts->GetGlyphRangesJapanese();
-            io.Fonts->AddFontFromFileTTF(f2.c_str(), 28.0f, &cfg, ranges);
-            Log("Attempted to merge Japanese font.");
-        } else {
-            Log("Failed to load mod_font.otf!");
+        std::string f1 = GetModDirectory() + "\\assets\\mod_font.otf";
+        std::string f2 = GetModDirectory() + "\\assets\\mod_font_japanese.ttf";
+        const ImWchar* ranges = io.Fonts->GetGlyphRangesJapanese();
+
+        g_pMenuFont = io.Fonts->AddFontFromFileTTF(f1.c_str(), 18.0f);
+        if (g_pMenuFont) {
+            ImFontConfig cfg1;
+            cfg1.MergeMode = true;
+            io.Fonts->AddFontFromFileTTF(f2.c_str(), 18.0f, &cfg1, ranges);
         }
 
-        std::string texStr = GetModDirectory() + "\\assets/bgm_info.dds";
+        g_pToastFont = io.Fonts->AddFontFromFileTTF(f1.c_str(), 28.0f);
+        if (g_pToastFont) {
+            ImFontConfig cfg2;
+            cfg2.MergeMode = true;
+            io.Fonts->AddFontFromFileTTF(f2.c_str(), 28.0f, &cfg2, ranges);
+        }
+
+        std::string texStr = GetModDirectory() + "\\assets\\bgm_info.dds";
         std::wstring texW(texStr.begin(), texStr.end());
         HRESULT hr = DirectX::CreateDDSTextureFromFile(g_pd3dDevice, texW.c_str(), &g_pToastResource, &g_pToastTexture);
         if (SUCCEEDED(hr) && g_pToastResource) {
-            Log("bgm_info.dds loaded successfully.");
             ID3D11Texture2D* pTex = nullptr;
             if (SUCCEEDED(g_pToastResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTex))) {
                 D3D11_TEXTURE2D_DESC desc;
@@ -458,27 +608,44 @@ void InitImGui(IDXGISwapChain* pSwapChain) {
                 g_TextureWidth = (float)desc.Width;
                 g_TextureHeight = (float)desc.Height;
                 pTex->Release();
-                Log("Texture size: " + std::to_string(g_TextureWidth) + "x" + std::to_string(g_TextureHeight));
             }
-        } else {
-            Log("Failed to load bgm_info.dds! HR: " + std::to_string(hr));
         }
 
         ImGui_ImplWin32_Init(g_hWindow);
         ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-
-        Log("ImGui initialized successfully.");
         g_imguiInitialized = true;
-    } else {
-        Log("InitImGui FAILED to get D3D11 Device!");
+        Log("InitImGui finished successfully.");
+    }
+}
+
+void DrawRemapper(const char* label, int& key) {
+    std::string kn = GetKeyName(key);
+    char buf[128];
+    sprintf_s(buf, "%s###%s_btn", kn.c_str(), label);
+
+    if (ImGui::Button(buf, ImVec2(140, 0))) ImGui::OpenPopup(label);
+    ImGui::SameLine();
+    ImGui::Text("%s", label);
+
+    if (ImGui::BeginPopup(label)) {
+        ImGui::Text("Press any key...");
+        for (int i = 1; i < 256; i++) {
+            if (GetAsyncKeyState(i) & 0x8000) {
+                if (i != VK_LBUTTON && i != VK_RBUTTON) {
+                    key = i;
+                    ImGui::CloseCurrentPopup();
+                    break;
+                }
+            }
+        }
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
 }
 
 HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
     static int frameCount = 0;
     frameCount++;
-
-    // Log first few frames to confirm Present is being called
     if (frameCount <= 3) {
         Log("Present called, frame " + std::to_string(frameCount));
     }
@@ -510,7 +677,6 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         io.DisplaySize.y = actual_height;
     }
 
-    // Detect resolution change and reset toast animation if needed
     if (actual_width != g_lastDisplayWidth || actual_height != g_lastDisplayHeight) {
         g_lastDisplayWidth = actual_width;
         g_lastDisplayHeight = actual_height;
@@ -522,14 +688,45 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
 
-    const float UI_SCALE = 0.65f;
+    if (g_showMenu) {
+        ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Falcom BGM Info Settings", &g_showMenu)) {
+            ImGui::Checkbox("Ignore Cooldown (Always Show)", &g_ModConfig.ignoreCooldown);
+            ImGui::Checkbox("Show Japanese Name", &g_ModConfig.showJapanese);
+            ImGui::SliderFloat("Toast Duration", &g_ModConfig.toastDuration, 1.0f, 20.0f, "%.1f seconds");
+            ImGui::SliderFloat("UI Scale", &g_ModConfig.uiScale, 0.3f, 2.0f, "%.2f");
+            
+            int h = g_ModConfig.cooldownHours;
+            if (ImGui::SliderInt("Cooldown (Hours)", &h, 0, 24)) {
+                g_ModConfig.cooldownHours = h;
+            }
+            
+            ImGui::Separator();
+            ImGui::Text("Hotkeys:");
+            DrawRemapper("Menu Hotkey", g_ModConfig.menuHotkey);
+            DrawRemapper("Show Info Hotkey", g_ModConfig.showHotkey);
+            
+            if (ImGui::Button("Reset Cooldowns")) g_songLastShown.clear();
+            if (ImGui::Button("Save Configuration")) SaveConfig();
+        }
+        ImGui::End();
+        
+        if (!g_showMenu) {
+            io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+            io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+            io.MouseDrawCursor = false;
+            SaveConfig();
+        }
+    }
+
+    const float UI_SCALE = g_ModConfig.uiScale;
     const float SCREEN_PADDING = 10.0f;
     const float TEXT_PADDING_X = 20.0f * UI_SCALE;
     const float TEXT_PADDING_Y = 15.0f * UI_SCALE;
 
     std::string line1 = g_currentBgmInfo.songName;
     std::string line2 = "";
-    if (!g_currentBgmInfo.japaneseName.empty()) {
+    if (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) {
         line2 = "(" + g_currentBgmInfo.japaneseName + ")";
     }
     std::string line3 = g_currentBgmInfo.version;
@@ -539,7 +736,7 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
     }
     std::string line5 = g_currentBgmInfo.album;
 
-    if (g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) {
+    if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !line1.empty()) {
         bool fontPushed = false;
         if (g_pToastFont && g_pToastFont->IsLoaded()) {
             ImGui::PushFont(g_pToastFont);
@@ -555,7 +752,6 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         float text_width = std::max({s1.x, s2.x, s3.x, s4.x, s5.x});
         float line_height = s1.y > 0 ? s1.y : 28.0f;
 
-        // Minimum width fallback (estimate ~8px per character if font fails)
         if (text_width < 50.0f) {
             size_t maxLen = std::max({line1.length(), line2.length(), line3.length(), line4.length(), line5.length()});
             text_width = std::max(text_width, (float)maxLen * 8.0f);
@@ -577,7 +773,6 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         float screen_width = io.DisplaySize.x;
         float top_y = SCREEN_PADDING;
 
-        // Clamp toast width to 80% of screen to prevent overflow
         float maxWidth = screen_width * 0.8f;
         float effectiveWidth = std::min(total_width, maxWidth);
 
@@ -640,14 +835,6 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
         }
 
         if (fontPushed) ImGui::PopFont();
-    }
-
-    // Debug: Log rendering state periodically
-    static int renderLogCounter = 0;
-    if (g_toastTimer > 0.0f && renderLogCounter++ % 60 == 0) {
-        Log("Rendering toast: X=" + std::to_string(g_toastCurrentX) +
-            " Timer=" + std::to_string(g_toastTimer) +
-            " Display=" + std::to_string(io.DisplaySize.x) + "x" + std::to_string(io.DisplaySize.y));
     }
 
     ImGui::Render();
@@ -766,21 +953,24 @@ void ProcessBgmTrigger(const std::string& s_filename) {
 
             std::string songKey = g_currentBgmInfo.songName;
             bool shouldShow = false;
-            auto it = g_songLastShown.find(songKey);
 
-            if (it == g_songLastShown.end()) {
+            if (g_ModConfig.ignoreCooldown) {
                 shouldShow = true;
             } else {
-                auto now = std::chrono::steady_clock::now();
-                auto hours = std::chrono::duration_cast<std::chrono::hours>(now - it->second).count();
-                if (hours >= COOLDOWN_HOURS) shouldShow = true;
+                auto it = g_songLastShown.find(songKey);
+                if (it == g_songLastShown.end()) {
+                    shouldShow = true;
+                } else {
+                    auto now = std::chrono::steady_clock::now();
+                    auto hours = std::chrono::duration_cast<std::chrono::hours>(now - it->second).count();
+                    if (hours >= g_ModConfig.cooldownHours) shouldShow = true;
+                }
             }
 
             if (shouldShow) {
-                g_toastTimer = TOAST_DURATION_SECONDS;
+                g_toastTimer = g_ModConfig.toastDuration;
                 g_songLastShown[songKey] = std::chrono::steady_clock::now();
                 g_toastCurrentX = -10000.0f;
-                Log("TOAST TRIGGERED: " + g_currentBgmInfo.songName + " | ImGui initialized: " + (g_imguiInitialized ? "YES" : "NO"));
             }
             break;
         }
@@ -850,6 +1040,7 @@ void InitializeHooks() {
     Log("Hook thread started.");
 
     DetectAndConfigure();
+    LoadConfig();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
@@ -905,6 +1096,24 @@ void InitializeHooks() {
                 }
             }
         }
+    }
+
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        void* pSetCursorPos = (void*)GetProcAddress(hUser32, "SetCursorPos");
+        if (pSetCursorPos) MH_CreateHook(pSetCursorPos, &Detour_SetCursorPos, (LPVOID*)&g_pfnOriginalSetCursorPos);
+        
+        void* pClipCursor = (void*)GetProcAddress(hUser32, "ClipCursor");
+        if (pClipCursor) MH_CreateHook(pClipCursor, &Detour_ClipCursor, (LPVOID*)&g_pfnOriginalClipCursor);
+        
+        void* pGetAsyncKeyState = (void*)GetProcAddress(hUser32, "GetAsyncKeyState");
+        if (pGetAsyncKeyState) MH_CreateHook(pGetAsyncKeyState, &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
+        
+        void* pGetKeyState = (void*)GetProcAddress(hUser32, "GetKeyState");
+        if (pGetKeyState) MH_CreateHook(pGetKeyState, &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
+        
+        void* pGetKeyboardState = (void*)GetProcAddress(hUser32, "GetKeyboardState");
+        if (pGetKeyboardState) MH_CreateHook(pGetKeyboardState, &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
     }
 
     uintptr_t pPresentAddr = FindPresentAddress(hTempWnd);
