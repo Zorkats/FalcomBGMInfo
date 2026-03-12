@@ -30,6 +30,8 @@
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
 
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam); // I don't know why it doesn't compile without this even though imgui_impl_win32.h and .cpp are included.
+
 // =============================================================
 // CONFIGURATION SYSTEM
 // =============================================================
@@ -351,48 +353,60 @@ static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
 
 BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+    if (res && g_showMenu && lpMsg) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
         }
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-            lpMsg->message = WM_NULL;
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
         }
     }
     return res;
 }
 BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+    if (res && g_showMenu && lpMsg) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
         }
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-            lpMsg->message = WM_NULL;
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
         }
     }
     return res;
 }
 BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
     BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+    if (res && g_showMenu && lpMsg) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
         }
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-            lpMsg->message = WM_NULL;
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
         }
     }
     return res;
 }
 BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
     BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+    if (res && g_showMenu && lpMsg) {
         if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
             if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
         }
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-            lpMsg->message = WM_NULL;
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
         }
     }
     return res;

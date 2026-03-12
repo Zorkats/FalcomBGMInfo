@@ -226,6 +226,77 @@ BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
     return g_pfnOriginalClipCursor(lpRect);
 }
 
+// Aggressive Message Blocking
+typedef BOOL(WINAPI* PFN_PEEKMESSAGEA)(LPMSG, HWND, UINT, UINT, UINT);
+typedef BOOL(WINAPI* PFN_PEEKMESSAGEW)(LPMSG, HWND, UINT, UINT, UINT);
+typedef BOOL(WINAPI* PFN_GETMESSAGEA)(LPMSG, HWND, UINT, UINT);
+typedef BOOL(WINAPI* PFN_GETMESSAGEW)(LPMSG, HWND, UINT, UINT);
+static PFN_PEEKMESSAGEA g_pfnOriginalPeekMessageA = nullptr;
+static PFN_PEEKMESSAGEW g_pfnOriginalPeekMessageW = nullptr;
+static PFN_GETMESSAGEA g_pfnOriginalGetMessageA = nullptr;
+static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
+
+BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+    BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    if (res && g_showMenu && lpMsg) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+    BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    if (res && g_showMenu && lpMsg) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
+    BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
+    if (res && g_showMenu && lpMsg) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
+    BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
+    if (res && g_showMenu && lpMsg) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if (!g_isRemapping) {
+            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
+                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
+                lpMsg->message = WM_NULL;
+            }
+        }
+    }
+    return res;
+}
+
 // =============================================================
 // MEMORY SCANNER
 // =============================================================
@@ -888,6 +959,10 @@ void InitializeHooks() {
         MH_CreateHook(GetProcAddress(hU32, "GetAsyncKeyState"), &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
         MH_CreateHook(GetProcAddress(hU32, "GetKeyState"), &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
         MH_CreateHook(GetProcAddress(hU32, "GetKeyboardState"), &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
+        MH_CreateHook(GetProcAddress(hU32, "PeekMessageA"), &Detour_PeekMessageA, (LPVOID*)&g_pfnOriginalPeekMessageA);
+        MH_CreateHook(GetProcAddress(hU32, "PeekMessageW"), &Detour_PeekMessageW, (LPVOID*)&g_pfnOriginalPeekMessageW);
+        MH_CreateHook(GetProcAddress(hU32, "GetMessageA"), &Detour_GetMessageA, (LPVOID*)&g_pfnOriginalGetMessageA);
+        MH_CreateHook(GetProcAddress(hU32, "GetMessageW"), &Detour_GetMessageW, (LPVOID*)&g_pfnOriginalGetMessageW);
     }
     
     HMODULE hUcrt = GetModuleHandleA("ucrtbase.dll");
