@@ -272,6 +272,7 @@ static std::map<std::string, BgmInfo> g_bgmMap;
 static BgmInfo g_currentBgmInfo;
 static std::map<std::string, std::chrono::steady_clock::time_point> g_songLastShown;
 static std::string g_lastTriggeredFile = "";
+static std::mutex g_BgmMutex;
 
 static float g_toastTimer = 0.0f;
 static float g_toastCurrentX = -10000.0f;
@@ -280,6 +281,7 @@ static float g_lastDisplayHeight = 0.0f;
 
 static bool g_imguiInitialized = false;
 static bool g_showMenu = false;
+static bool g_isRemapping = false;
 static HWND g_hWindow = nullptr;
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -302,21 +304,21 @@ static std::atomic<bool> g_bWorkerThreadActive = true;
 typedef SHORT(WINAPI* PFN_GETASYNCKEYSTATE)(int);
 static PFN_GETASYNCKEYSTATE g_pfnOriginalGetAsyncKeyState = nullptr;
 SHORT WINAPI Detour_GetAsyncKeyState(int vKey) {
-    if (g_showMenu) return 0;
+    if (g_showMenu && !g_isRemapping) return 0;
     return g_pfnOriginalGetAsyncKeyState(vKey);
 }
 
 typedef SHORT(WINAPI* PFN_GETKEYSTATE)(int);
 static PFN_GETKEYSTATE g_pfnOriginalGetKeyState = nullptr;
 SHORT WINAPI Detour_GetKeyState(int nVirtKey) {
-    if (g_showMenu) return 0;
+    if (g_showMenu && !g_isRemapping) return 0;
     return g_pfnOriginalGetKeyState(nVirtKey);
 }
 
 typedef BOOL(WINAPI* PFN_GETKEYBOARDSTATE)(PBYTE);
 static PFN_GETKEYBOARDSTATE g_pfnOriginalGetKeyboardState = nullptr;
 BOOL WINAPI Detour_GetKeyboardState(PBYTE lpKeyState) {
-    if (g_showMenu && lpKeyState) {
+    if (g_showMenu && !g_isRemapping && lpKeyState) {
         memset(lpKeyState, 0, 256);
         return TRUE;
     }
@@ -326,15 +328,74 @@ BOOL WINAPI Detour_GetKeyboardState(PBYTE lpKeyState) {
 typedef BOOL(WINAPI* PFN_SETCURSORPOS)(int, int);
 static PFN_SETCURSORPOS g_pfnOriginalSetCursorPos = nullptr;
 BOOL WINAPI Detour_SetCursorPos(int X, int Y) {
-    if (g_showMenu) return TRUE;
+    if (g_showMenu && !g_isRemapping) return TRUE;
     return g_pfnOriginalSetCursorPos(X, Y);
 }
 
 typedef BOOL(WINAPI* PFN_CLIPCURSOR)(const RECT*);
 static PFN_CLIPCURSOR g_pfnOriginalClipCursor = nullptr;
 BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
-    if (g_showMenu) return TRUE;
+    if (g_showMenu && !g_isRemapping) return TRUE;
     return g_pfnOriginalClipCursor(lpRect);
+}
+
+// XInput Blocking
+typedef struct _XINPUT_STATE { DWORD dwPacketNumber; BYTE Gamepad[12]; } XINPUT_STATE;
+typedef DWORD(WINAPI* PFN_XINPUTGETSTATE)(DWORD, XINPUT_STATE*);
+static PFN_XINPUTGETSTATE g_pfnOriginalXInputGetState = nullptr;
+DWORD WINAPI Detour_XInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
+    if (g_showMenu && !g_isRemapping) {
+        if (pState) memset(pState, 0, sizeof(XINPUT_STATE));
+        return 0; // ERROR_SUCCESS
+    }
+    return g_pfnOriginalXInputGetState ? g_pfnOriginalXInputGetState(dwUserIndex, pState) : 1167;
+}
+
+// Aggressive Message Blocking
+typedef BOOL(WINAPI* PFN_PEEKMESSAGEA)(LPMSG, HWND, UINT, UINT, UINT);
+typedef BOOL(WINAPI* PFN_PEEKMESSAGEW)(LPMSG, HWND, UINT, UINT, UINT);
+typedef BOOL(WINAPI* PFN_GETMESSAGEA)(LPMSG, HWND, UINT, UINT);
+typedef BOOL(WINAPI* PFN_GETMESSAGEW)(LPMSG, HWND, UINT, UINT);
+static PFN_PEEKMESSAGEA g_pfnOriginalPeekMessageA = nullptr;
+static PFN_PEEKMESSAGEW g_pfnOriginalPeekMessageW = nullptr;
+static PFN_GETMESSAGEA g_pfnOriginalGetMessageA = nullptr;
+static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
+
+BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+    BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+            lpMsg->message = WM_NULL;
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
+    BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
+    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+            lpMsg->message = WM_NULL;
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
+    BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
+    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+            lpMsg->message = WM_NULL;
+        }
+    }
+    return res;
+}
+BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
+    BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
+    if (res && g_showMenu && !g_isRemapping && lpMsg) {
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+            lpMsg->message = WM_NULL;
+        }
+    }
+    return res;
 }
 
 // =============================================================
@@ -537,13 +598,14 @@ LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
     if (g_showMenu) {
         ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
-        // Block mouse and keyboard inputs from reaching the game
-        if ((uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) ||
-            (uMsg >= WM_KEYFIRST && uMsg <= WM_KEYLAST) ||
-            uMsg == WM_INPUT) {
-            return 1;
+        if (!g_isRemapping) {
+            // Block mouse and keyboard inputs from reaching the game while menu is open
+            if ((uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) ||
+                (uMsg >= WM_KEYFIRST && uMsg <= WM_KEYLAST) ||
+                uMsg == WM_INPUT) {
+                return 1;
+            }
         }
-        // Other non-input messages pass through normally
     } else {
         ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     }
@@ -628,17 +690,22 @@ void DrawRemapper(const char* label, int& key) {
     ImGui::Text("%s", label);
 
     if (ImGui::BeginPopup(label)) {
+        g_isRemapping = true;
         ImGui::Text("Press any key...");
         for (int i = 1; i < 256; i++) {
-            if (GetAsyncKeyState(i) & 0x8000) {
+            if (g_pfnOriginalGetAsyncKeyState(i) & 0x8000) {
                 if (i != VK_LBUTTON && i != VK_RBUTTON) {
                     key = i;
                     ImGui::CloseCurrentPopup();
+                    g_isRemapping = false;
                     break;
                 }
             }
         }
-        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+            g_isRemapping = false;
+        }
         ImGui::EndPopup();
     }
 }
@@ -687,6 +754,8 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
 
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
+    
+    g_isRemapping = false; // Reset remapping flag every frame
 
     if (g_showMenu) {
         ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
@@ -706,7 +775,7 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
             DrawRemapper("Menu Hotkey", g_ModConfig.menuHotkey);
             DrawRemapper("Show Info Hotkey", g_ModConfig.showHotkey);
             
-            if (ImGui::Button("Reset Cooldowns")) g_songLastShown.clear();
+            if (ImGui::Button("Reset Cooldowns")) { std::lock_guard<std::mutex> lock(g_BgmMutex); g_songLastShown.clear(); }
             if (ImGui::Button("Save Configuration")) SaveConfig();
         }
         ImGui::End();
@@ -724,117 +793,120 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
     const float TEXT_PADDING_X = 20.0f * UI_SCALE;
     const float TEXT_PADDING_Y = 15.0f * UI_SCALE;
 
-    std::string line1 = g_currentBgmInfo.songName;
-    std::string line2 = "";
-    if (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) {
-        line2 = "(" + g_currentBgmInfo.japaneseName + ")";
-    }
-    std::string line3 = g_currentBgmInfo.version;
-    std::string line4 = "";
-    if (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) {
-        line4 = "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track;
-    }
-    std::string line5 = g_currentBgmInfo.album;
-
-    if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !line1.empty()) {
-        bool fontPushed = false;
-        if (g_pToastFont && g_pToastFont->IsLoaded()) {
-            ImGui::PushFont(g_pToastFont);
-            fontPushed = true;
+    {
+        std::lock_guard<std::mutex> lock(g_BgmMutex);
+        std::string line1 = g_currentBgmInfo.songName;
+        std::string line2 = "";
+        if (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) {
+            line2 = "(" + g_currentBgmInfo.japaneseName + ")";
         }
-
-        ImVec2 s1 = ImGui::CalcTextSize(line1.c_str());
-        ImVec2 s2 = ImGui::CalcTextSize(line2.c_str());
-        ImVec2 s3 = ImGui::CalcTextSize(line3.c_str());
-        ImVec2 s4 = ImGui::CalcTextSize(line4.c_str());
-        ImVec2 s5 = ImGui::CalcTextSize(line5.c_str());
-
-        float text_width = std::max({s1.x, s2.x, s3.x, s4.x, s5.x});
-        float line_height = s1.y > 0 ? s1.y : 28.0f;
-
-        if (text_width < 50.0f) {
-            size_t maxLen = std::max({line1.length(), line2.length(), line3.length(), line4.length(), line5.length()});
-            text_width = std::max(text_width, (float)maxLen * 8.0f);
+        std::string line3 = g_currentBgmInfo.version;
+        std::string line4 = "";
+        if (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) {
+            line4 = "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track;
         }
+        std::string line5 = g_currentBgmInfo.album;
 
-        int line_count = 0;
-        if (!line1.empty()) line_count++;
-        if (!line2.empty()) line_count++;
-        if (!line3.empty()) line_count++;
-        if (!line4.empty()) line_count++;
-        if (!line5.empty()) line_count++;
-
-        float text_height = line_height * (float)line_count + (line_height * 0.2f * (line_count - 1));
-        float total_height = text_height + (TEXT_PADDING_Y * 2.0f);
-        float note_icon_width = total_height;
-        float box_width = text_width + (TEXT_PADDING_X * 2.0f);
-        float total_width = note_icon_width + box_width;
-
-        float screen_width = io.DisplaySize.x;
-        float top_y = SCREEN_PADDING;
-
-        float maxWidth = screen_width * 0.8f;
-        float effectiveWidth = std::min(total_width, maxWidth);
-
-        float target_onscreen_x = screen_width - effectiveWidth - SCREEN_PADDING;
-        if (target_onscreen_x < SCREEN_PADDING) target_onscreen_x = SCREEN_PADDING;
-        float target_offscreen_x = screen_width + SCREEN_PADDING;
-
-        if (g_toastCurrentX == -10000.0f) {
-            g_toastCurrentX = target_offscreen_x;
-        }
-
-        float deltaTime = io.DeltaTime;
-        float animSpeed = 1500.0f;
-
-        if (g_toastTimer > 0.0f) {
-            if (g_toastCurrentX > target_onscreen_x) {
-                g_toastCurrentX -= animSpeed * deltaTime;
-                if (g_toastCurrentX < target_onscreen_x) g_toastCurrentX = target_onscreen_x;
-            }
-            g_toastTimer -= deltaTime;
-        } else {
-            if (g_toastCurrentX < target_offscreen_x) {
-                g_toastCurrentX += animSpeed * deltaTime;
-            } else {
-                g_toastCurrentX = -10000.0f;
-            }
-        }
-
-        if (g_toastCurrentX != -10000.0f) {
-            ImDrawList* dl = ImGui::GetForegroundDrawList();
-            float y = top_y;
-
-            dl->AddRectFilled(
-                ImVec2(g_toastCurrentX + note_icon_width, y),
-                ImVec2(g_toastCurrentX + total_width, y + total_height),
-                IM_COL32(0, 0, 0, 180), 8.0f
-            );
-
-            if (g_pToastTexture) {
-                dl->AddImage(
-                    (void*)g_pToastTexture,
-                    ImVec2(g_toastCurrentX, y),
-                    ImVec2(g_toastCurrentX + note_icon_width, y + total_height)
-                );
+        if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !line1.empty()) {
+            bool fontPushed = false;
+            if (g_pToastFont && g_pToastFont->IsLoaded()) {
+                ImGui::PushFont(g_pToastFont);
+                fontPushed = true;
             }
 
-            float ty = y + TEXT_PADDING_Y;
-            auto DrawLine = [&](const std::string& s, ImU32 color) {
-                if (!s.empty()) {
-                    dl->AddText(ImVec2(g_toastCurrentX + note_icon_width + TEXT_PADDING_X, ty), color, s.c_str());
-                    ty += line_height * 1.2f;
+            ImVec2 s1 = ImGui::CalcTextSize(line1.c_str());
+            ImVec2 s2 = ImGui::CalcTextSize(line2.c_str());
+            ImVec2 s3 = ImGui::CalcTextSize(line3.c_str());
+            ImVec2 s4 = ImGui::CalcTextSize(line4.c_str());
+            ImVec2 s5 = ImGui::CalcTextSize(line5.c_str());
+
+            float text_width = std::max({s1.x, s2.x, s3.x, s4.x, s5.x});
+            float line_height = s1.y > 0 ? s1.y : 28.0f;
+
+            if (text_width < 50.0f) {
+                size_t maxLen = std::max({line1.length(), line2.length(), line3.length(), line4.length(), line5.length()});
+                text_width = std::max(text_width, (float)maxLen * 8.0f);
+            }
+
+            int line_count = 0;
+            if (!line1.empty()) line_count++;
+            if (!line2.empty()) line_count++;
+            if (!line3.empty()) line_count++;
+            if (!line4.empty()) line_count++;
+            if (!line5.empty()) line_count++;
+
+            float text_height = line_height * (float)line_count + (line_height * 0.2f * (line_count - 1));
+            float total_height = text_height + (TEXT_PADDING_Y * 2.0f);
+            float note_icon_width = total_height;
+            float box_width = text_width + (TEXT_PADDING_X * 2.0f);
+            float total_width = note_icon_width + box_width;
+
+            float screen_width = io.DisplaySize.x;
+            float top_y = SCREEN_PADDING;
+
+            float maxWidth = screen_width * 0.8f;
+            float effectiveWidth = std::min(total_width, maxWidth);
+
+            float target_onscreen_x = screen_width - effectiveWidth - SCREEN_PADDING;
+            if (target_onscreen_x < SCREEN_PADDING) target_onscreen_x = SCREEN_PADDING;
+            float target_offscreen_x = screen_width + SCREEN_PADDING;
+
+            if (g_toastCurrentX == -10000.0f) {
+                g_toastCurrentX = target_offscreen_x;
+            }
+
+            float deltaTime = io.DeltaTime;
+            float animSpeed = 1500.0f;
+
+            if (g_toastTimer > 0.0f) {
+                if (g_toastCurrentX > target_onscreen_x) {
+                    g_toastCurrentX -= animSpeed * deltaTime;
+                    if (g_toastCurrentX < target_onscreen_x) g_toastCurrentX = target_onscreen_x;
                 }
-            };
+                g_toastTimer -= deltaTime;
+            } else {
+                if (g_toastCurrentX < target_offscreen_x) {
+                    g_toastCurrentX += animSpeed * deltaTime;
+                } else {
+                    g_toastCurrentX = -10000.0f;
+                }
+            }
 
-            DrawLine(line1, IM_COL32_WHITE);
-            DrawLine(line2, IM_COL32(200, 200, 200, 255));
-            DrawLine(line3, IM_COL32(180, 180, 180, 255));
-            DrawLine(line4, IM_COL32(180, 180, 180, 255));
-            DrawLine(line5, IM_COL32(180, 180, 180, 255));
+            if (g_toastCurrentX != -10000.0f) {
+                ImDrawList* dl = ImGui::GetForegroundDrawList();
+                float y = top_y;
+
+                dl->AddRectFilled(
+                    ImVec2(g_toastCurrentX + note_icon_width, y),
+                    ImVec2(g_toastCurrentX + total_width, y + total_height),
+                    IM_COL32(0, 0, 0, 180), 8.0f
+                );
+
+                if (g_pToastTexture) {
+                    dl->AddImage(
+                        (void*)g_pToastTexture,
+                        ImVec2(g_toastCurrentX, y),
+                        ImVec2(g_toastCurrentX + note_icon_width, y + total_height)
+                    );
+                }
+
+                float ty = y + TEXT_PADDING_Y;
+                auto DrawLine = [&](const std::string& s, ImU32 color) {
+                    if (!s.empty()) {
+                        dl->AddText(ImVec2(g_toastCurrentX + note_icon_width + TEXT_PADDING_X, ty), color, s.c_str());
+                        ty += line_height * 1.2f;
+                    }
+                };
+
+                DrawLine(line1, IM_COL32_WHITE);
+                DrawLine(line2, IM_COL32(200, 200, 200, 255));
+                DrawLine(line3, IM_COL32(180, 180, 180, 255));
+                DrawLine(line4, IM_COL32(180, 180, 180, 255));
+                DrawLine(line5, IM_COL32(180, 180, 180, 255));
+            }
+
+            if (fontPushed) ImGui::PopFont();
         }
-
-        if (fontPushed) ImGui::PopFont();
     }
 
     ImGui::Render();
@@ -948,6 +1020,7 @@ void ProcessBgmTrigger(const std::string& s_filename) {
 
             Log("MATCH FOUND for: " + key);
 
+            std::lock_guard<std::mutex> lock(g_BgmMutex);
             g_currentBgmInfo = entry.second;
             g_currentBgmInfo.rawFileName = entry.first;
 
@@ -1100,21 +1173,35 @@ void InitializeHooks() {
 
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
-        void* pSetCursorPos = (void*)GetProcAddress(hUser32, "SetCursorPos");
-        if (pSetCursorPos) MH_CreateHook(pSetCursorPos, &Detour_SetCursorPos, (LPVOID*)&g_pfnOriginalSetCursorPos);
+        MH_CreateHook(GetProcAddress(hUser32, "SetCursorPos"), &Detour_SetCursorPos, (LPVOID*)&g_pfnOriginalSetCursorPos);
+        MH_CreateHook(GetProcAddress(hUser32, "ClipCursor"), &Detour_ClipCursor, (LPVOID*)&g_pfnOriginalClipCursor);
+        MH_CreateHook(GetProcAddress(hUser32, "GetAsyncKeyState"), &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
+        MH_CreateHook(GetProcAddress(hUser32, "GetKeyState"), &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
+        MH_CreateHook(GetProcAddress(hUser32, "GetKeyboardState"), &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
         
-        void* pClipCursor = (void*)GetProcAddress(hUser32, "ClipCursor");
-        if (pClipCursor) MH_CreateHook(pClipCursor, &Detour_ClipCursor, (LPVOID*)&g_pfnOriginalClipCursor);
-        
-        void* pGetAsyncKeyState = (void*)GetProcAddress(hUser32, "GetAsyncKeyState");
-        if (pGetAsyncKeyState) MH_CreateHook(pGetAsyncKeyState, &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
-        
-        void* pGetKeyState = (void*)GetProcAddress(hUser32, "GetKeyState");
-        if (pGetKeyState) MH_CreateHook(pGetKeyState, &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
-        
-        void* pGetKeyboardState = (void*)GetProcAddress(hUser32, "GetKeyboardState");
-        if (pGetKeyboardState) MH_CreateHook(pGetKeyboardState, &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
+        MH_CreateHook(GetProcAddress(hUser32, "PeekMessageA"), &Detour_PeekMessageA, (LPVOID*)&g_pfnOriginalPeekMessageA);
+        MH_CreateHook(GetProcAddress(hUser32, "PeekMessageW"), &Detour_PeekMessageW, (LPVOID*)&g_pfnOriginalPeekMessageW);
+        MH_CreateHook(GetProcAddress(hUser32, "GetMessageA"), &Detour_GetMessageA, (LPVOID*)&g_pfnOriginalGetMessageA);
+        MH_CreateHook(GetProcAddress(hUser32, "GetMessageW"), &Detour_GetMessageW, (LPVOID*)&g_pfnOriginalGetMessageW);
+        Log("User32 hooks enabled (including PeekMessage/GetMessage).");
     }
+
+    // Try to hook XInput for blocking
+    auto HookX = [&](const char* dllName) {
+        HMODULE h = GetModuleHandleA(dllName);
+        if (h) {
+            void* p = GetProcAddress(h, "XInputGetState");
+            if (p) {
+                if (MH_CreateHook(p, &Detour_XInputGetState, (LPVOID*)&g_pfnOriginalXInputGetState) == MH_OK) {
+                    MH_EnableHook(p);
+                    Log("Hooked XInputGetState in " + std::string(dllName));
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (!HookX("xinput1_3.dll")) if (!HookX("xinput1_4.dll")) HookX("xinput9_1_0.dll");
 
     uintptr_t pPresentAddr = FindPresentAddress(hTempWnd);
     DestroyWindow(hTempWnd);  // Done with temp window
