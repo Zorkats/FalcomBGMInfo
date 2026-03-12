@@ -339,18 +339,6 @@ BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
     return g_pfnOriginalClipCursor(lpRect);
 }
 
-// XInput Blocking
-typedef struct _XINPUT_STATE { DWORD dwPacketNumber; BYTE Gamepad[12]; } XINPUT_STATE;
-typedef DWORD(WINAPI* PFN_XINPUTGETSTATE)(DWORD, XINPUT_STATE*);
-static PFN_XINPUTGETSTATE g_pfnOriginalXInputGetState = nullptr;
-DWORD WINAPI Detour_XInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState) {
-    if (g_showMenu && !g_isRemapping) {
-        if (pState) memset(pState, 0, sizeof(XINPUT_STATE));
-        return 0; // ERROR_SUCCESS
-    }
-    return g_pfnOriginalXInputGetState ? g_pfnOriginalXInputGetState(dwUserIndex, pState) : 1167;
-}
-
 // Aggressive Message Blocking
 typedef BOOL(WINAPI* PFN_PEEKMESSAGEA)(LPMSG, HWND, UINT, UINT, UINT);
 typedef BOOL(WINAPI* PFN_PEEKMESSAGEW)(LPMSG, HWND, UINT, UINT, UINT);
@@ -364,7 +352,10 @@ static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
 BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
     if (res && g_showMenu && !g_isRemapping && lpMsg) {
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
             lpMsg->message = WM_NULL;
         }
     }
@@ -373,7 +364,10 @@ BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT
 BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
     BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
     if (res && g_showMenu && !g_isRemapping && lpMsg) {
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
             lpMsg->message = WM_NULL;
         }
     }
@@ -382,7 +376,10 @@ BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT
 BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
     BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
     if (res && g_showMenu && !g_isRemapping && lpMsg) {
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
             lpMsg->message = WM_NULL;
         }
     }
@@ -391,7 +388,10 @@ BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT 
 BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
     BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
     if (res && g_showMenu && !g_isRemapping && lpMsg) {
-        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT) {
+        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
+            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
+        }
+        if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
             lpMsg->message = WM_NULL;
         }
     }
@@ -1186,23 +1186,7 @@ void InitializeHooks() {
         Log("User32 hooks enabled (including PeekMessage/GetMessage).");
     }
 
-    // Try to hook XInput for blocking
-    auto HookX = [&](const char* dllName) {
-        HMODULE h = GetModuleHandleA(dllName);
-        if (h) {
-            void* p = GetProcAddress(h, "XInputGetState");
-            if (p) {
-                if (MH_CreateHook(p, &Detour_XInputGetState, (LPVOID*)&g_pfnOriginalXInputGetState) == MH_OK) {
-                    MH_EnableHook(p);
-                    Log("Hooked XInputGetState in " + std::string(dllName));
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
-    if (!HookX("xinput1_3.dll")) if (!HookX("xinput1_4.dll")) HookX("xinput9_1_0.dll");
-
+    // Gamepad blocking removed as requested
     uintptr_t pPresentAddr = FindPresentAddress(hTempWnd);
     DestroyWindow(hTempWnd);  // Done with temp window
 

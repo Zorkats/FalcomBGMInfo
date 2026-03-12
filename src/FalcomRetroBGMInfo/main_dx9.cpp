@@ -435,7 +435,7 @@ void DetectAndConfigure() {
 // INPUT & WNDPROC
 // =============================================================
 LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_KEYDOWN) {
+    if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
         if (wParam == g_ModConfig.menuHotkey) {
             g_showMenu = !g_showMenu; ImGuiIO& io = ImGui::GetIO();
             if (g_showMenu) {
@@ -451,6 +451,7 @@ LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
         if (wParam == g_ModConfig.showHotkey && !g_showMenu) {
+            std::lock_guard<std::mutex> lock(g_BgmMutex);
             g_toastTimer = g_ModConfig.toastDuration;
             g_toastCurrentX = -10000.0f;
             return 0;
@@ -468,13 +469,15 @@ LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                 case WM_MOUSEWHEEL:  case WM_MOUSEHWHEEL: case WM_MOUSEMOVE:
                 case WM_INPUT:
                 case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+                case WM_CHAR:
                     return 1;
             }
-            return TRUE;
         }
+        if (uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) return 1;
+    } else {
+        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     }
     
-    ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
 }
 
@@ -755,12 +758,12 @@ static void* g_pfnOriginalInternalFopen = nullptr;
 
 std::string GetXanaduFilename(int id) {
     switch(id) {
-        case 0: return "XANA000"; case 1: return "XANA001"; case 2: return "XANA002"; case 3: return "XANA003";
-        case 4: return "XANA004"; case 5: return "XANA010"; case 6: return "XANA020"; case 7: return "XANA030";
-        case 8: return "XANA040"; case 9: return "XANA050"; case 10: return "XANA060"; case 11: return "XANA070";
-        case 12: return "XANA080"; case 13: return "XANA090"; case 14: return "XANA100"; case 15: return "XANA110";
-        case 16: return "XANA200"; case 17: return "XANA210"; case 18: return "XANA300"; case 19: return "XANA310";
-        case 20: return "XANA320"; case 21: return "XANA330"; case 22: return "XANA340"; case 23: return "XANA350";
+        case 0: return "XANA000.dec"; case 1: return "XANA001.dec"; case 2: return "XANA002.dec"; case 3: return "XANA003.dec";
+        case 4: return "XANA004.dec"; case 5: return "XANA010.dec"; case 6: return "XANA020.dec"; case 7: return "XANA030.dec";
+        case 8: return "XANA040.dec"; case 9: return "XANA050.dec"; case 10: return "XANA060.dec"; case 11: return "XANA070.dec";
+        case 12: return "XANA080.dec"; case 13: return "XANA090.dec"; case 14: return "XANA100.dec"; case 15: return "XANA110.dec";
+        case 16: return "XANA200.dec"; case 17: return "XANA210.dec"; case 18: return "XANA300.dec"; case 19: return "XANA310.dec";
+        case 20: return "XANA320.dec"; case 21: return "XANA330.dec"; case 22: return "XANA340.dec"; case 23: return "XANA350.dec";
         default: return "";
     }
 }
@@ -887,15 +890,6 @@ void InitializeHooks() {
         MH_CreateHook(GetProcAddress(hU32, "GetKeyboardState"), &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
     }
     
-    auto HookX = [&](const char* dllName) {
-        HMODULE h = GetModuleHandleA(dllName);
-        if (h) {
-            void* p = GetProcAddress(h, "XInputGetState");
-            if (p) { if (MH_CreateHook(p, &Detour_XInputGetState, (LPVOID*)&g_pfnOriginalXInputGetState) == MH_OK) MH_EnableHook(p); }
-        }
-    };
-    HookX("xinput1_4.dll"); HookX("xinput1_3.dll"); HookX("xinput9_1_0.dll");
-
     HMODULE hUcrt = GetModuleHandleA("ucrtbase.dll");
     if (hUcrt) {
         void* p = GetProcAddress(hUcrt, "fopen");
