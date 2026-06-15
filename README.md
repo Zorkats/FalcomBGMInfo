@@ -22,6 +22,7 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 * **Ys: Memories of Celceta** (x86)
 * **Ys VIII: Lacrimosa of DANA**
 * **Ys IX: Monstrum Nox**
+* **Tokyo Xanadu eX+** (x86) (Thanks so much Imaple0!)
 
 ### Retro (DirectX 9)
 * **Xanadu Next** (Requires renaming to dinput8.dll and DX9 Wrapper, attached on release)
