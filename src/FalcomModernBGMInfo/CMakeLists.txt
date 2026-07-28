@@ -73,6 +73,7 @@ target_link_libraries(FalcomModernBGMInfo PRIVATE
         Microsoft::DirectXTK
 
         shlwapi
+        comctl32
         d3d11
         winmm
 )

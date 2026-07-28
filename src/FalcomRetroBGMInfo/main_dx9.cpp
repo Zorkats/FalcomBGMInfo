@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <windows.h>
+#include <commctrl.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #include <psapi.h>
@@ -28,12 +29,15 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include "imgui_impl_dx9.h"
+#include "bgm_path_utils.h"
+#include "owner_thread_subclass.h"
+#include "synchronized_snapshot.h"
 
 // =============================================================
 // CONFIGURATION SYSTEM
 // =============================================================
 enum class GameID {
-    Unknown, XanaduNext, YsSeven, YsOrigin, YsVI, YsFelghana, SkyFC, SkySC, Sky3rd
+    Unknown, XanaduNext, YsSeven, YsOrigin, YsVI, YsFelghana, SkyFC, SkySC, Sky3rd, Zwei2
 };
 
 struct GameConfig {
@@ -64,11 +68,14 @@ struct BgmInfo {
 // GLOBALS
 // =============================================================
 GameConfig g_Config;
-ModConfig g_ModConfig;
+SynchronizedSnapshot<ModConfig> g_ModConfig;
 GameID g_CurrentGame = GameID::Unknown;
 static std::mutex g_LogMutex;
+static std::mutex g_ConfigSaveMutex;
+static HANDLE g_LogFileHandle = INVALID_HANDLE_VALUE;
 static std::string g_modDirectory = "";
 static bool g_IsGog = false;
+static HMODULE g_ModuleHandle = nullptr;
 
 static std::map<std::string, BgmInfo> g_bgmMap;
 static BgmInfo g_currentBgmInfo;
@@ -81,24 +88,38 @@ static float g_toastCurrentX = -10000.0f;
 static float g_lastDisplayWidth = 0.0f;
 static float g_lastDisplayHeight = 0.0f;
 
-static bool g_imguiInitialized = false;
-static bool g_showMenu = false;
+static std::atomic<bool> g_imguiInitialized = false;
+static std::atomic<bool> g_showMenu = false;
 static bool g_isRemapping = false;
-static bool g_bEndSceneHooked = false;
+static std::recursive_mutex g_RendererMutex;
 static HWND g_hWindow = nullptr;
+static IDirect3DDevice9* g_pRendererDevice = nullptr;
+static bool g_win32BackendInitialized = false;
+static bool g_dx9BackendInitialized = false;
+static constexpr UINT_PTR kBgmInfoSubclassId = 0x4642474D;
+static bgm_window::OwnerThreadSubclass g_WindowSubclass;
 static ImFont* g_pMenuFont = nullptr;
 static ImFont* g_pToastFont = nullptr;
 static LPDIRECT3DTEXTURE9 g_pToastTexture = nullptr;
+static bool g_textureLoadAttempted = false;
 static float g_TextureWidth = 0.0f;
 static float g_TextureHeight = 0.0f;
+static std::atomic<uint32_t> g_resetDepth = 0;
+static std::atomic<uint64_t> g_resetGeneration = 0;
+static std::atomic<uint64_t> g_successfulResetGeneration = 0;
+static std::atomic<bool> g_dx9DeviceObjectsInvalidated = false;
+static std::once_flag g_FileHookOnce;
+static std::once_flag g_DeviceHookOnce;
+static std::once_flag g_BgmWorkerOnce;
 
 static std::thread g_workerThread;
 static std::mutex g_bufferMutex;
 static char g_bgmFilenameBuffer[MAX_PATH];
 static std::atomic<bool> g_bNewBgmAvailable = false;
 static std::atomic<bool> g_bWorkerThreadActive = true;
+static std::atomic<bool> g_bWorkerThreadStarted = false;
+static std::atomic<HANDLE> g_workerWakeEvent = nullptr;
 
-static WNDPROC g_pfnOriginalWndProc = NULL;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // =============================================================
@@ -117,15 +138,51 @@ void Log(const std::string& message) {
     std::string dir = g_modDirectory;
     if (dir.empty()) dir = ResolveModDirectory();
     std::lock_guard<std::mutex> lock(g_LogMutex);
-    std::string path = dir + "\\mod_log.txt";
-    std::ofstream log_file(path, std::ios_base::app | std::ios_base::out);
+    if (g_LogFileHandle == INVALID_HANDLE_VALUE) {
+        const std::string path = dir + "\\mod_log.txt";
+        g_LogFileHandle = CreateFileA(
+            path.c_str(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+    }
+    if (g_LogFileHandle == INVALID_HANDLE_VALUE) {
+        return;
+    }
     
     auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     char time_str[26];
     ctime_s(time_str, sizeof(time_str), &time);
     time_str[24] = '\0';
     
-    log_file << "[" << time_str << "] " << message << std::endl;
+    const std::string line =
+        "[" + std::string(time_str) + "] " + message + "\r\n";
+    DWORD bytesWritten = 0;
+    WriteFile(
+        g_LogFileHandle,
+        line.data(),
+        static_cast<DWORD>(line.size()),
+        &bytesWritten,
+        nullptr
+    );
+}
+
+bool PinModuleForProcessLifetime() {
+    HMODULE pinnedModule = nullptr;
+    const BOOL pinned = GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCSTR>(&PinModuleForProcessLifetime),
+        &pinnedModule
+    );
+    if (pinned) {
+        g_ModuleHandle = pinnedModule;
+    }
+    return pinned != FALSE;
 }
 
 void WCharToString(const WCHAR* wstr, char* buffer, size_t bufferSize) {
@@ -133,21 +190,78 @@ void WCharToString(const WCHAR* wstr, char* buffer, size_t bufferSize) {
     WideCharToMultiByte(CP_UTF8, 0, wstr, -1, buffer, (int)bufferSize, NULL, NULL);
 }
 
+void SignalBgmWorker() {
+    HANDLE wakeEvent = g_workerWakeEvent.load();
+    if (wakeEvent) {
+        SetEvent(wakeEvent);
+    }
+}
+
+bool PublishPendingBgmFilename(const char* filename) {
+    if (!filename) {
+        return false;
+    }
+
+    bool published = false;
+    {
+        std::lock_guard<std::mutex> lock(g_bufferMutex);
+        if (strcpy_s(
+                g_bgmFilenameBuffer,
+                MAX_PATH,
+                filename) == 0) {
+            g_bNewBgmAvailable = true;
+            published = true;
+        }
+    }
+    if (published) {
+        SignalBgmWorker();
+    }
+    return published;
+}
+
+bool PublishPendingBgmFilename(const wchar_t* filename) {
+    if (!filename) {
+        return false;
+    }
+
+    char convertedFilename[MAX_PATH] = {};
+    WCharToString(
+        filename,
+        convertedFilename,
+        MAX_PATH
+    );
+    if (convertedFilename[0] == '\0') {
+        return false;
+    }
+    return PublishPendingBgmFilename(convertedFilename);
+}
+
 void SaveConfig() {
     std::string path = g_modDirectory + "\\mod_config.yaml";
     try {
-        YAML::Emitter out;
-        out << YAML::BeginMap;
-        out << YAML::Key << "IgnoreCooldown" << YAML::Value << g_ModConfig.ignoreCooldown;
-        out << YAML::Key << "ShowHotkey" << YAML::Value << g_ModConfig.showHotkey;
-        out << YAML::Key << "MenuHotkey" << YAML::Value << g_ModConfig.menuHotkey;
-        out << YAML::Key << "ToastDuration" << YAML::Value << g_ModConfig.toastDuration;
-        out << YAML::Key << "CooldownHours" << YAML::Value << g_ModConfig.cooldownHours;
-        out << YAML::Key << "ShowJapanese" << YAML::Value << g_ModConfig.showJapanese;
-        out << YAML::Key << "UIScale" << YAML::Value << g_ModConfig.uiScale;
-        out << YAML::EndMap;
-        std::ofstream fout(path);
-        fout << out.c_str();
+        {
+            std::lock_guard<std::mutex> lock(g_ConfigSaveMutex);
+            const ModConfig config = g_ModConfig.Load();
+            YAML::Emitter out;
+            out << YAML::BeginMap;
+            out << YAML::Key << "IgnoreCooldown" << YAML::Value << config.ignoreCooldown;
+            out << YAML::Key << "ShowHotkey" << YAML::Value << config.showHotkey;
+            out << YAML::Key << "MenuHotkey" << YAML::Value << config.menuHotkey;
+            out << YAML::Key << "ToastDuration" << YAML::Value << config.toastDuration;
+            out << YAML::Key << "CooldownHours" << YAML::Value << config.cooldownHours;
+            out << YAML::Key << "ShowJapanese" << YAML::Value << config.showJapanese;
+            out << YAML::Key << "UIScale" << YAML::Value << config.uiScale;
+            out << YAML::EndMap;
+            const std::string serializedConfig = out.c_str();
+            std::ofstream fout(
+                path,
+                std::ios::out | std::ios::trunc
+            );
+            fout.exceptions(
+                std::ios::failbit | std::ios::badbit
+            );
+            fout << serializedConfig;
+        }
     } catch (...) {}
 }
 
@@ -160,14 +274,16 @@ void LoadConfig() {
     }
     try {
         YAML::Node config = YAML::Load(fin);
-        if (config["IgnoreCooldown"]) g_ModConfig.ignoreCooldown = config["IgnoreCooldown"].as<bool>();
-        if (config["AlwaysShow"]) g_ModConfig.ignoreCooldown = config["AlwaysShow"].as<bool>();
-        if (config["ShowHotkey"]) g_ModConfig.showHotkey = config["ShowHotkey"].as<int>();
-        if (config["MenuHotkey"]) g_ModConfig.menuHotkey = config["MenuHotkey"].as<int>();
-        if (config["ToastDuration"]) g_ModConfig.toastDuration = config["ToastDuration"].as<float>();
-        if (config["CooldownHours"]) g_ModConfig.cooldownHours = config["CooldownHours"].as<int>();
-        if (config["ShowJapanese"]) g_ModConfig.showJapanese = config["ShowJapanese"].as<bool>();
-        if (config["UIScale"]) g_ModConfig.uiScale = config["UIScale"].as<float>();
+        ModConfig loadedConfig = g_ModConfig.Load();
+        if (config["IgnoreCooldown"]) loadedConfig.ignoreCooldown = config["IgnoreCooldown"].as<bool>();
+        if (config["AlwaysShow"]) loadedConfig.ignoreCooldown = config["AlwaysShow"].as<bool>();
+        if (config["ShowHotkey"]) loadedConfig.showHotkey = config["ShowHotkey"].as<int>();
+        if (config["MenuHotkey"]) loadedConfig.menuHotkey = config["MenuHotkey"].as<int>();
+        if (config["ToastDuration"]) loadedConfig.toastDuration = config["ToastDuration"].as<float>();
+        if (config["CooldownHours"]) loadedConfig.cooldownHours = config["CooldownHours"].as<int>();
+        if (config["ShowJapanese"]) loadedConfig.showJapanese = config["ShowJapanese"].as<bool>();
+        if (config["UIScale"]) loadedConfig.uiScale = config["UIScale"].as<float>();
+        g_ModConfig.Store(loadedConfig);
     } catch (...) {}
 }
 
@@ -186,115 +302,6 @@ std::string GetKeyName(int vkCode) {
         lParamValue |= (1 << 24);
     if (GetKeyNameTextA(lParamValue, name, sizeof(name)) > 0) return std::string(name);
     std::stringstream ss; ss << "Key: 0x" << std::hex << vkCode; return ss.str();
-}
-
-// =============================================================
-// INPUT BLOCKING
-// =============================================================
-typedef SHORT(WINAPI* PFN_GETASYNCKEYSTATE)(int);
-static PFN_GETASYNCKEYSTATE g_pfnOriginalGetAsyncKeyState = nullptr;
-SHORT WINAPI Detour_GetAsyncKeyState(int vKey) {
-    if (g_showMenu && !g_isRemapping) return 0;
-    return g_pfnOriginalGetAsyncKeyState(vKey);
-}
-
-typedef SHORT(WINAPI* PFN_GETKEYSTATE)(int);
-static PFN_GETKEYSTATE g_pfnOriginalGetKeyState = nullptr;
-SHORT WINAPI Detour_GetKeyState(int nVirtKey) {
-    if (g_showMenu && !g_isRemapping) return 0;
-    return g_pfnOriginalGetKeyState(nVirtKey);
-}
-
-typedef BOOL(WINAPI* PFN_GETKEYBOARDSTATE)(PBYTE);
-static PFN_GETKEYBOARDSTATE g_pfnOriginalGetKeyboardState = nullptr;
-BOOL WINAPI Detour_GetKeyboardState(PBYTE lpKeyState) {
-    if (g_showMenu && !g_isRemapping && lpKeyState) { memset(lpKeyState, 0, 256); return TRUE; }
-    return g_pfnOriginalGetKeyboardState(lpKeyState);
-}
-
-typedef BOOL(WINAPI* PFN_SETCURSORPOS)(int, int);
-static PFN_SETCURSORPOS g_pfnOriginalSetCursorPos = nullptr;
-BOOL WINAPI Detour_SetCursorPos(int X, int Y) {
-    if (g_showMenu && !g_isRemapping) return TRUE;
-    return g_pfnOriginalSetCursorPos(X, Y);
-}
-
-typedef BOOL(WINAPI* PFN_CLIPCURSOR)(const RECT*);
-static PFN_CLIPCURSOR g_pfnOriginalClipCursor = nullptr;
-BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
-    if (g_showMenu && !g_isRemapping) return TRUE;
-    return g_pfnOriginalClipCursor(lpRect);
-}
-
-// Aggressive Message Blocking
-typedef BOOL(WINAPI* PFN_PEEKMESSAGEA)(LPMSG, HWND, UINT, UINT, UINT);
-typedef BOOL(WINAPI* PFN_PEEKMESSAGEW)(LPMSG, HWND, UINT, UINT, UINT);
-typedef BOOL(WINAPI* PFN_GETMESSAGEA)(LPMSG, HWND, UINT, UINT);
-typedef BOOL(WINAPI* PFN_GETMESSAGEW)(LPMSG, HWND, UINT, UINT);
-static PFN_PEEKMESSAGEA g_pfnOriginalPeekMessageA = nullptr;
-static PFN_PEEKMESSAGEW g_pfnOriginalPeekMessageW = nullptr;
-static PFN_GETMESSAGEA g_pfnOriginalGetMessageA = nullptr;
-static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
-
-BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
 }
 
 // =============================================================
@@ -372,14 +379,7 @@ bool __stdcall TryExtract(DWORD addr) {
         if (l < 4) return false;
         
         if (tolower(p[l-1]) == 'g' && tolower(p[l-2]) == 'g' && tolower(p[l-3]) == 'o' && p[l-4] == '.') {
-            if (g_bufferMutex.try_lock()) {
-                if (!g_bNewBgmAvailable) {
-                    strcpy_s(g_bgmFilenameBuffer, MAX_PATH, p);
-                    g_bNewBgmAvailable = true;
-                }
-                g_bufferMutex.unlock();
-            }
-            return true;
+            return PublishPendingBgmFilename(p);
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
     return false;
@@ -475,6 +475,12 @@ void DetectAndConfigure() {
         g_Config.yamlFiles.push_back("BgmMap_YsFelghana.yaml");
         g_Config.useFileHook = true;
     }
+    else if (exe.find("zwei2pdx9.exe") != std::string::npos) {
+        g_CurrentGame = GameID::Zwei2;
+        g_Config.gameName = "Zwei II";
+        g_Config.yamlFiles.push_back("BgmMap_Zwei2.yaml");
+        g_Config.useFileHook = true;
+    }
     else if (exe.find("ed6_win") != std::string::npos) {
         if (exe.find("win2") != std::string::npos) {
             g_CurrentGame = GameID::SkySC;
@@ -505,51 +511,67 @@ void DetectAndConfigure() {
 // =============================================================
 // INPUT & WNDPROC
 // =============================================================
-LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK WndProc(
+    HWND hWnd,
+    UINT uMsg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR referenceData
+) {
+    static_cast<void>(subclassId);
+    static_cast<void>(referenceData);
+    if (g_WindowSubclass.HandleControlMessage(hWnd, uMsg)) {
+        return 0;
+    }
+    if (uMsg == WM_NCDESTROY) {
+        g_imguiInitialized = false;
+        g_WindowSubclass.NotifyDestroyed(hWnd);
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    }
+
+    const ModConfig config = g_ModConfig.Load();
     if (uMsg == WM_KEYDOWN || uMsg == WM_SYSKEYDOWN) {
-        if (wParam == g_ModConfig.menuHotkey) {
-            g_showMenu = !g_showMenu; ImGuiIO& io = ImGui::GetIO();
-            if (g_showMenu) {
-                io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
-                io.ConfigFlags &= ~ImGuiConfigFlags_NoKeyboard;
-                io.MouseDrawCursor = true;
-            } else {
-                io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
-                io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
-                io.MouseDrawCursor = false;
+        if (wParam == config.menuHotkey) {
+            const bool showMenu = !g_showMenu.load();
+            g_showMenu = showMenu;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+                if (g_imguiInitialized.load() && ImGui::GetCurrentContext()) {
+                    ImGuiIO& io = ImGui::GetIO();
+                    if (showMenu) {
+                        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+                        io.ConfigFlags &= ~ImGuiConfigFlags_NoKeyboard;
+                        io.MouseDrawCursor = true;
+                    } else {
+                        io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+                        io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+                        io.MouseDrawCursor = false;
+                    }
+                }
+            }
+            if (!showMenu) {
                 SaveConfig();
             }
             return 0;
         }
-        if (wParam == g_ModConfig.showHotkey && !g_showMenu) {
+        if (wParam == config.showHotkey && !g_showMenu.load()) {
             std::lock_guard<std::mutex> lock(g_BgmMutex);
-            g_toastTimer = g_ModConfig.toastDuration;
+            g_toastTimer = config.toastDuration;
             g_toastCurrentX = -10000.0f;
             return 0;
         }
     }
     
-    if (g_showMenu) {
-        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
-        if (!g_isRemapping) {
-            switch (uMsg) {
-                case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
-                case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
-                case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
-                case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
-                case WM_MOUSEWHEEL:  case WM_MOUSEHWHEEL: case WM_MOUSEMOVE:
-                case WM_INPUT:
-                case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
-                case WM_CHAR:
-                    return 1;
-            }
+    if (g_showMenu.load()) {
+        std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+        if (g_imguiInitialized.load()) {
+            ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
         }
-        if (uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) return 1;
-    } else {
-        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     }
-    
-    return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
+
+    // Keep the window-procedure chain intact so other overlays can observe their input.
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
 // =============================================================
@@ -572,7 +594,27 @@ HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwSha
 HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate);
 void BgmWorkerThread();
 
+bool EnsureBgmWorkerStarted() {
+    std::call_once(g_BgmWorkerOnce, []() {
+        if (!g_workerWakeEvent.load()) {
+            Log("BGM worker event is unavailable; worker was not started.");
+            return;
+        }
+
+        g_bWorkerThreadActive = true;
+        g_workerThread = std::thread(BgmWorkerThread);
+        g_workerThread.detach();
+        g_bWorkerThreadStarted = true;
+    });
+    return g_bWorkerThreadStarted.load();
+}
+
 void LoadDdsTexture(IDirect3DDevice9* pDevice) {
+    if (g_textureLoadAttempted) {
+        return;
+    }
+    g_textureLoadAttempted = true;
+
     std::string path = g_modDirectory + "\\assets/bgm_info.dds";
     if (SUCCEEDED(D3DXCreateTextureFromFileA(pDevice, path.c_str(), &g_pToastTexture))) {
         D3DSURFACE_DESC desc;
@@ -582,13 +624,144 @@ void LoadDdsTexture(IDirect3DDevice9* pDevice) {
     }
 }
 
-void InitImGui(IDirect3DDevice9* pDevice) {
-    if (g_imguiInitialized) return;
-    D3DDEVICE_CREATION_PARAMETERS params;
-    if (SUCCEEDED(pDevice->GetCreationParameters(&params))) g_hWindow = params.hFocusWindow;
-    if (!g_hWindow) return;
+void EnsureFileHooks() {
+    if (!g_Config.useFileHook) {
+        return;
+    }
+
+    std::call_once(g_FileHookOnce, []() {
+        if (!EnsureBgmWorkerStarted()) {
+            return;
+        }
+        HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+        if (!kernel32) {
+            return;
+        }
+        MH_CreateHook(
+            GetProcAddress(kernel32, "CreateFileW"),
+            &Detour_CreateFileW,
+            reinterpret_cast<LPVOID*>(&g_pfnOriginalCreateFileW)
+        );
+        MH_CreateHook(
+            GetProcAddress(kernel32, "CreateFileA"),
+            &Detour_CreateFileA,
+            reinterpret_cast<LPVOID*>(&g_pfnOriginalCreateFileA)
+        );
+        MH_EnableHook(MH_ALL_HOOKS);
+    });
+}
+
+bool HasRendererResourcesLocked() {
+    return
+        g_pRendererDevice ||
+        g_win32BackendInitialized ||
+        g_dx9BackendInitialized ||
+        ImGui::GetCurrentContext();
+}
+
+void LogSubclassFailureLocked() {
+    bgm_window::SubclassPhase failedPhase;
+    DWORD errorCode = ERROR_SUCCESS;
+    if (!g_WindowSubclass.ConsumeFailure(failedPhase, errorCode)) {
+        return;
+    }
+
+    const char* operation =
+        failedPhase == bgm_window::SubclassPhase::RemoveFailed
+            ? "removal"
+            : "installation";
+    Log(
+        std::string("Owner-thread window subclass ") +
+        operation +
+        " failed with Win32 error " +
+        std::to_string(errorCode) +
+        ". The operation will not be retried for this window."
+    );
+}
+
+void FinalizeRendererShutdownLocked() {
+    g_imguiInitialized = false;
+
+    if (g_dx9BackendInitialized) {
+        ImGui_ImplDX9_Shutdown();
+        g_dx9BackendInitialized = false;
+    }
+    if (g_win32BackendInitialized) {
+        ImGui_ImplWin32_Shutdown();
+        g_win32BackendInitialized = false;
+    }
+    if (g_pToastTexture) {
+        g_pToastTexture->Release();
+        g_pToastTexture = nullptr;
+    }
+    if (ImGui::GetCurrentContext()) {
+        ImGui::DestroyContext();
+    }
+    if (g_pRendererDevice) {
+        g_pRendererDevice->Release();
+        g_pRendererDevice = nullptr;
+    }
+
+    g_pMenuFont = nullptr;
+    g_pToastFont = nullptr;
+    g_textureLoadAttempted = false;
+    g_TextureWidth = 0.0f;
+    g_TextureHeight = 0.0f;
+    g_lastDisplayWidth = 0.0f;
+    g_lastDisplayHeight = 0.0f;
+    g_dx9DeviceObjectsInvalidated = false;
+    g_successfulResetGeneration = 0;
+    g_hWindow = nullptr;
+}
+
+bool ShutdownRendererLocked() {
+    g_imguiInitialized = false;
+
+    const bgm_window::SubclassPhase phase = g_WindowSubclass.Phase();
+    if (phase == bgm_window::SubclassPhase::Installed ||
+        phase == bgm_window::SubclassPhase::InstallQueued) {
+        g_WindowSubclass.RequestRemove();
+    }
+
+    LogSubclassFailureLocked();
+    if (!g_WindowSubclass.CanDisposeRenderer()) {
+        return false;
+    }
+    if (HasRendererResourcesLocked()) {
+        FinalizeRendererShutdownLocked();
+    }
+    return true;
+}
+
+bool CompleteRendererActivationLocked() {
+    if (g_WindowSubclass.IsInstalledFor(
+            g_hWindow,
+            reinterpret_cast<std::uintptr_t>(
+                g_pRendererDevice))) {
+        g_imguiInitialized = true;
+        return true;
+    }
+
+    LogSubclassFailureLocked();
+    if (g_WindowSubclass.CanDisposeRenderer() &&
+        HasRendererResourcesLocked()) {
+        FinalizeRendererShutdownLocked();
+    }
+    return false;
+}
+
+bool InitializeRendererLocked(
+    IDirect3DDevice9* pDevice,
+    HWND window
+) {
+    if (!pDevice || !window) {
+        return false;
+    }
+
+    g_hWindow = window;
+    g_pRendererDevice = pDevice;
+    g_pRendererDevice->AddRef();
     
-    g_pfnOriginalWndProc = (WNDPROC)SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -605,21 +778,90 @@ void InitImGui(IDirect3DDevice9* pDevice) {
     if (g_pToastFont) { ImFontConfig cfg2; cfg2.MergeMode = true; io.Fonts->AddFontFromFileTTF(f2.c_str(), 28.0f, &cfg2, r); }
     
     LoadDdsTexture(pDevice);
-    ImGui_ImplWin32_Init(g_hWindow);
-    ImGui_ImplDX9_Init(pDevice);
-    g_imguiInitialized = true;
-    
-    if (g_Config.useFileHook) {
-        g_bWorkerThreadActive = true;
-        g_workerThread = std::thread(BgmWorkerThread);
-        HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-        MH_CreateHook(GetProcAddress(hK32, "CreateFileW"), &Detour_CreateFileW, (LPVOID*)&g_pfnOriginalCreateFileW);
-        MH_CreateHook(GetProcAddress(hK32, "CreateFileA"), &Detour_CreateFileA, (LPVOID*)&g_pfnOriginalCreateFileA);
-        MH_EnableHook(MH_ALL_HOOKS);
+    if (!ImGui_ImplWin32_Init(g_hWindow)) {
+        FinalizeRendererShutdownLocked();
+        return false;
     }
+    g_win32BackendInitialized = true;
+    if (!ImGui_ImplDX9_Init(pDevice)) {
+        FinalizeRendererShutdownLocked();
+        return false;
+    }
+    g_dx9BackendInitialized = true;
+
+    const std::uintptr_t rendererToken =
+        reinterpret_cast<std::uintptr_t>(pDevice);
+    if (!g_WindowSubclass.RequestInstall(
+            g_hWindow,
+            rendererToken) &&
+        !g_WindowSubclass.IsInstalledFor(
+            g_hWindow,
+            rendererToken)) {
+        LogSubclassFailureLocked();
+        if (g_WindowSubclass.CanDisposeRenderer()) {
+            FinalizeRendererShutdownLocked();
+        }
+        return false;
+    }
+    return CompleteRendererActivationLocked();
+}
+
+bool EnsureRendererLocked(
+    IDirect3DDevice9* pDevice,
+    HWND window
+) {
+    const bool sameOwnership =
+        g_pRendererDevice == pDevice &&
+        g_hWindow == window;
+
+    if (sameOwnership && HasRendererResourcesLocked()) {
+        return CompleteRendererActivationLocked();
+    }
+    if (HasRendererResourcesLocked() &&
+        !ShutdownRendererLocked()) {
+        return false;
+    }
+    if (g_WindowSubclass.IsInstallBlockedFor(
+            window,
+            reinterpret_cast<std::uintptr_t>(pDevice))) {
+        LogSubclassFailureLocked();
+        return false;
+    }
+    return InitializeRendererLocked(pDevice, window);
+}
+
+HWND ResolveDeviceWindow(IDirect3DDevice9* pDevice) {
+    IDirect3DSwapChain9* swapChain = nullptr;
+    if (SUCCEEDED(pDevice->GetSwapChain(0, &swapChain)) &&
+        swapChain) {
+        D3DPRESENT_PARAMETERS presentParameters = {};
+        const HRESULT result =
+            swapChain->GetPresentParameters(&presentParameters);
+        swapChain->Release();
+        if (SUCCEEDED(result) &&
+            presentParameters.hDeviceWindow) {
+            return presentParameters.hDeviceWindow;
+        }
+    }
+
+    D3DDEVICE_CREATION_PARAMETERS creationParameters = {};
+    if (SUCCEEDED(pDevice->GetCreationParameters(
+            &creationParameters))) {
+        return creationParameters.hFocusWindow;
+    }
+    return nullptr;
 }
 
 HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
+    if (g_resetDepth.load() != 0) {
+        return g_pfnOriginalEndScene(pDevice);
+    }
+
+    const HWND deviceWindow = ResolveDeviceWindow(pDevice);
+    if (!deviceWindow) {
+        return g_pfnOriginalEndScene(pDevice);
+    }
+
     IDirect3DSurface9* pCurrentRT = nullptr;
     IDirect3DSurface9* pBackBuffer = nullptr;
     bool isBackBuffer = false;
@@ -632,24 +874,51 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     }
     if (!isBackBuffer) return g_pfnOriginalEndScene(pDevice);
 
-    InitImGui(pDevice);
-    if (!g_pToastTexture && g_imguiInitialized) LoadDdsTexture(pDevice);
+    std::unique_lock<std::recursive_mutex> rendererLock(g_RendererMutex);
+    if (g_resetDepth.load() != 0 ||
+        !EnsureRendererLocked(
+            pDevice,
+            deviceWindow)) {
+        rendererLock.unlock();
+        return g_pfnOriginalEndScene(pDevice);
+    }
+    if (g_dx9DeviceObjectsInvalidated.load()) {
+        const uint64_t currentResetGeneration =
+            g_resetGeneration.load();
+        if (g_successfulResetGeneration.load() !=
+            currentResetGeneration) {
+            rendererLock.unlock();
+            return g_pfnOriginalEndScene(pDevice);
+        }
+        if (!ImGui_ImplDX9_CreateDeviceObjects()) {
+            rendererLock.unlock();
+            return g_pfnOriginalEndScene(pDevice);
+        }
+        g_textureLoadAttempted = false;
+        g_dx9DeviceObjectsInvalidated = false;
+    }
+    if (!g_pToastTexture && !g_textureLoadAttempted) {
+        LoadDdsTexture(pDevice);
+    }
     
+    ModConfig config = g_ModConfig.Load();
+    bool saveConfigRequested = false;
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
     ImGuiIO& io = ImGui::GetIO();
     g_isRemapping = false;
     
-    if (g_showMenu) {
+    bool showMenu = g_showMenu.load();
+    if (showMenu) {
         ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("Falcom BGM Info Settings", &g_showMenu)) {
-            ImGui::Checkbox("Ignore Cooldown (Always Show)", &g_ModConfig.ignoreCooldown);
-            ImGui::Checkbox("Show Japanese Name", &g_ModConfig.showJapanese);
-            ImGui::SliderFloat("Toast Duration", &g_ModConfig.toastDuration, 1.0f, 20.0f, "%.1f seconds");
-            ImGui::SliderFloat("UI Scale", &g_ModConfig.uiScale, 0.3f, 2.0f, "%.2f");
-            int h = g_ModConfig.cooldownHours;
-            if (ImGui::SliderInt("Cooldown (Hours)", &h, 0, 24)) g_ModConfig.cooldownHours = h;
+        if (ImGui::Begin("Falcom BGM Info Settings", &showMenu)) {
+            ImGui::Checkbox("Ignore Cooldown (Always Show)", &config.ignoreCooldown);
+            ImGui::Checkbox("Show Japanese Name", &config.showJapanese);
+            ImGui::SliderFloat("Toast Duration", &config.toastDuration, 1.0f, 20.0f, "%.1f seconds");
+            ImGui::SliderFloat("UI Scale", &config.uiScale, 0.3f, 2.0f, "%.2f");
+            int h = config.cooldownHours;
+            if (ImGui::SliderInt("Cooldown (Hours)", &h, 0, 24)) config.cooldownHours = h;
             ImGui::Separator();
             ImGui::Text("Hotkeys:");
             auto DrawRemapper = [&](const char* label, int& key) {
@@ -671,15 +940,20 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
                     ImGui::EndPopup();
                 }
             };
-            DrawRemapper("Menu Hotkey", g_ModConfig.menuHotkey);
-            DrawRemapper("Show Info Hotkey", g_ModConfig.showHotkey);
+            DrawRemapper("Menu Hotkey", config.menuHotkey);
+            DrawRemapper("Show Info Hotkey", config.showHotkey);
             if (ImGui::Button("Reset Cooldowns")) { std::lock_guard<std::mutex> lock(g_BgmMutex); g_songLastShown.clear(); }
-            if (ImGui::Button("Save Configuration")) SaveConfig();
+            if (ImGui::Button("Save Configuration")) {
+                saveConfigRequested = true;
+            }
         }
         ImGui::End();
-        if (!g_showMenu) {
+        g_ModConfig.Store(config);
+        g_showMenu = showMenu;
+        if (!showMenu) {
             io.ConfigFlags |= ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoKeyboard;
-            io.MouseDrawCursor = false; SaveConfig();
+            io.MouseDrawCursor = false;
+            saveConfigRequested = true;
         }
     }
     
@@ -691,7 +965,7 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
         if (g_toastCurrentX != -10000.0f && g_toastTimer > 0.0f) g_toastCurrentX = -10000.0f;
     }
     
-    const float UI = g_ModConfig.uiScale, SP = 10.0f, TX = 20.0f * UI, TY = 15.0f * UI, RO = 8.0f * UI;
+    const float UI = config.uiScale, SP = 10.0f, TX = 20.0f * UI, TY = 15.0f * UI, RO = 8.0f * UI;
     {
         std::lock_guard<std::mutex> lock(g_BgmMutex);
         if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !g_currentBgmInfo.songName.empty()) {
@@ -700,9 +974,9 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
             ImVec2 s1 = ImGui::CalcTextSize(g_currentBgmInfo.songName.c_str());
             float LH = s1.y > 0 ? s1.y : (28.0f * UI);
             std::string dt = (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) ? "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track : "";
-            ImVec2 s2 = (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) ? ImGui::CalcTextSize(g_currentBgmInfo.japaneseName.c_str()) : ImVec2(0,0);
+            ImVec2 s2 = (config.showJapanese && !g_currentBgmInfo.japaneseName.empty()) ? ImGui::CalcTextSize(g_currentBgmInfo.japaneseName.c_str()) : ImVec2(0,0);
             float TW = std::max({s1.x, s2.x, ImGui::CalcTextSize(dt.c_str()).x, ImGui::CalcTextSize(g_currentBgmInfo.album.c_str()).x});
-            int LC = 0; if (!g_currentBgmInfo.songName.empty()) LC++; if (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) LC++; if (!dt.empty()) LC++; if (!g_currentBgmInfo.album.empty()) LC++;
+            int LC = 0; if (!g_currentBgmInfo.songName.empty()) LC++; if (config.showJapanese && !g_currentBgmInfo.japaneseName.empty()) LC++; if (!dt.empty()) LC++; if (!g_currentBgmInfo.album.empty()) LC++;
             float TH = LH * (float)LC + (LH * 0.2f * (LC - 1)), TTH = TH + (TY * 2.0f), NIW = TTH, BW = TW + (TX * 2.0f), TTW = NIW + BW;
             float target = io.DisplaySize.x - TTW - SP; if (target < SP) target = SP;
             if (g_toastCurrentX == -10000.0f) g_toastCurrentX = io.DisplaySize.x + SP;
@@ -725,7 +999,7 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
                     if (!s.empty()) { dl->AddText(ImVec2(p_box.x + TX, cY), col, s.c_str()); cY += LH * 1.2f; }
                 };
                 DrawLine(g_currentBgmInfo.songName, IM_COL32_WHITE);
-                if (g_ModConfig.showJapanese) DrawLine(g_currentBgmInfo.japaneseName, IM_COL32(200, 200, 200, 255));
+                if (config.showJapanese) DrawLine(g_currentBgmInfo.japaneseName, IM_COL32(200, 200, 200, 255));
                 DrawLine(dt, IM_COL32(180, 180, 180, 255));
                 DrawLine(g_currentBgmInfo.album, IM_COL32(180, 180, 180, 255));
             }
@@ -734,55 +1008,77 @@ HRESULT WINAPI My_EndScene(IDirect3DDevice9* pDevice) {
     }
     ImGui::EndFrame();
     ImGui::Render();
-    IDirect3DStateBlock9* pSB = nullptr;
-    if (SUCCEEDED(pDevice->CreateStateBlock(D3DSBT_ALL, &pSB)) && pSB) pSB->Capture();
-    pDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
-    if (pSB) { pSB->Apply(); pSB->Release(); }
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (drawData && drawData->TotalVtxCount > 0) {
+        DWORD previousSrgbWriteEnable = FALSE;
+        const bool hasSrgbState = SUCCEEDED(pDevice->GetRenderState(D3DRS_SRGBWRITEENABLE, &previousSrgbWriteEnable));
+        pDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        ImGui_ImplDX9_RenderDrawData(drawData);
+        if (hasSrgbState) {
+            pDevice->SetRenderState(D3DRS_SRGBWRITEENABLE, previousSrgbWriteEnable);
+        }
+    }
+    rendererLock.unlock();
+    if (saveConfigRequested) {
+        SaveConfig();
+    }
     return g_pfnOriginalEndScene(pDevice);
 }
 
 HRESULT WINAPI Detour_Reset(IDirect3DDevice9* pDevice, D3DPRESENT_PARAMETERS* pPresentationParameters) {
-    if (g_pToastTexture) { g_pToastTexture->Release(); g_pToastTexture = nullptr; }
-    ImGui_ImplDX9_InvalidateDeviceObjects();
-    HRESULT hr = g_pfnOriginalReset(pDevice, pPresentationParameters);
-    if (SUCCEEDED(hr)) ImGui_ImplDX9_CreateDeviceObjects();
-    return hr;
+    bool rendererReset = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+        if (g_pRendererDevice == pDevice &&
+            g_dx9BackendInitialized) {
+            rendererReset = true;
+            g_resetDepth.fetch_add(1);
+            g_resetGeneration.fetch_add(1);
+            if (g_pToastTexture) {
+                g_pToastTexture->Release();
+                g_pToastTexture = nullptr;
+            }
+            g_textureLoadAttempted = true;
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+            g_dx9DeviceObjectsInvalidated = true;
+        }
+    }
+
+    const HRESULT result =
+        g_pfnOriginalReset(pDevice, pPresentationParameters);
+
+    if (rendererReset) {
+        const uint64_t completedGeneration =
+            g_resetGeneration.fetch_add(1) + 1;
+        if (SUCCEEDED(result)) {
+            g_successfulResetGeneration = completedGeneration;
+        }
+        g_resetDepth.fetch_sub(1);
+    }
+    return result;
 }
 
 // =============================================================
 // BGM PROCESSING
 // =============================================================
-bool IsTarget(const std::string& fn) {
-    if (fn.length() < 4) return false;
-    std::string ex = fn.substr(fn.length() - 4);
-    std::transform(ex.begin(), ex.end(), ex.begin(), ::tolower);
-    return (ex == ".ogg" || ex == ".wav");
+bool IsTarget(const char* filename) {
+    return bgm_path::IsRetroAudioFile(filename);
 }
 
-bool IsTargetW(const std::wstring& fn) {
-    if (fn.length() < 4) return false;
-    std::wstring ex = fn.substr(fn.length() - 4);
-    std::transform(ex.begin(), ex.end(), ex.begin(), ::towlower);
-    return (ex == L".ogg" || ex == L".wav");
+bool IsTargetW(const wchar_t* filename) {
+    return bgm_path::IsRetroAudioFile(filename);
 }
 
 HANDLE WINAPI Detour_CreateFileW(LPCWSTR f, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sec, DWORD d, DWORD fl, HANDLE t) {
     if (f && IsTargetW(f)) {
-        if (g_bufferMutex.try_lock()) {
-            if (!g_bNewBgmAvailable) { WCharToString(f, g_bgmFilenameBuffer, MAX_PATH); g_bNewBgmAvailable = true; }
-            g_bufferMutex.unlock();
-        }
+        PublishPendingBgmFilename(f);
     }
     return g_pfnOriginalCreateFileW(f, a, s, sec, d, fl, t);
 }
 
 HANDLE WINAPI Detour_CreateFileA(LPCSTR f, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sec, DWORD d, DWORD fl, HANDLE t) {
     if (f && IsTarget(f)) {
-        if (g_bufferMutex.try_lock()) {
-            if (!g_bNewBgmAvailable) { strcpy_s(g_bgmFilenameBuffer, MAX_PATH, f); g_bNewBgmAvailable = true; }
-            g_bufferMutex.unlock();
-        }
+        PublishPendingBgmFilename(f);
     }
     return g_pfnOriginalCreateFileA(f, a, s, sec, d, fl, t);
 }
@@ -791,18 +1087,25 @@ void ProcessBgmTrigger(const std::string& fn) {
     if (fn == g_lastTriggeredFile) return;
     g_lastTriggeredFile = fn;
     
-    std::string input = fn;
-    std::replace(input.begin(), input.end(), '/', '\\');
-    for (auto& e : g_bgmMap) {
-        std::string k = e.first;
-        std::replace(k.begin(), k.end(), '/', '\\');
-        if (input.length() >= k.length() && input.compare(input.length() - k.length(), k.length(), k) == 0) {
-            g_currentBgmInfo = e.second;
-            bool show = g_ModConfig.ignoreCooldown || (g_songLastShown.find(e.second.songName) == g_songLastShown.end()) || 
-                        (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now() - g_songLastShown[e.second.songName]).count() >= g_ModConfig.cooldownHours);
+    const std::string input = bgm_path::NormalizeLookupPath(fn);
+    for (const auto& entry : g_bgmMap) {
+        if (bgm_path::HasExactSuffix(input, entry.first)) {
+            const ModConfig config = g_ModConfig.Load();
+            std::lock_guard<std::mutex> lock(g_BgmMutex);
+            g_currentBgmInfo = entry.second;
+
+            const auto now = std::chrono::steady_clock::now();
+            const auto lastShown = g_songLastShown.find(entry.second.songName);
+            const bool cooldownExpired =
+                lastShown != g_songLastShown.end() &&
+                std::chrono::duration_cast<std::chrono::hours>(now - lastShown->second).count() >=
+                    config.cooldownHours;
+            const bool show = config.ignoreCooldown ||
+                              lastShown == g_songLastShown.end() ||
+                              cooldownExpired;
             if (show) {
-                g_toastTimer = g_ModConfig.toastDuration;
-                g_songLastShown[e.second.songName] = std::chrono::steady_clock::now();
+                g_toastTimer = config.toastDuration;
+                g_songLastShown[entry.second.songName] = now;
                 g_toastCurrentX = -10000.0f;
             }
             break;
@@ -812,12 +1115,27 @@ void ProcessBgmTrigger(const std::string& fn) {
 
 void BgmWorkerThread() {
     while (g_bWorkerThreadActive) {
-        if (g_bNewBgmAvailable) {
-            std::string f;
-            { std::lock_guard<std::mutex> l(g_bufferMutex); f = g_bgmFilenameBuffer; g_bNewBgmAvailable = false; }
+        HANDLE wakeEvent = g_workerWakeEvent.load();
+        if (!wakeEvent ||
+            WaitForSingleObject(wakeEvent, INFINITE) !=
+                WAIT_OBJECT_0) {
+            break;
+        }
+        if (!g_bWorkerThreadActive) {
+            break;
+        }
+
+        std::string f;
+        {
+            std::lock_guard<std::mutex> lock(g_bufferMutex);
+            if (g_bNewBgmAvailable) {
+                f = g_bgmFilenameBuffer;
+                g_bNewBgmAvailable = false;
+            }
+        }
+        if (!f.empty()) {
             ProcessBgmTrigger(f);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -843,11 +1161,12 @@ void __stdcall ProcessXanaduLogic(int id_ecx, int id_stack) {
     int id = g_IsGog ? id_stack : id_ecx;
     std::string fn = GetXanaduFilename(id);
     if (!fn.empty()) {
+        const ModConfig config = g_ModConfig.Load();
         for (auto& e : g_bgmMap) {
             if (e.first.find(fn) != std::string::npos) {
                 std::lock_guard<std::mutex> lock(g_BgmMutex);
                 g_currentBgmInfo = e.second;
-                g_toastTimer = g_ModConfig.toastDuration;
+                g_toastTimer = config.toastDuration;
                 g_toastCurrentX = -10000.0f;
                 break;
             }
@@ -907,7 +1226,7 @@ void LoadBgmMap() {
                 if (pts.size() >= 4) i.track = pts[3];
                 if (pts.size() >= 5) i.album = pts[4];
                 if (i.japaneseName == i.songName) i.japaneseName = "";
-                g_bgmMap[path] = i;
+                g_bgmMap[bgm_path::NormalizeLookupPath(path)] = i;
             }
         } catch (...) {}
     }
@@ -915,20 +1234,20 @@ void LoadBgmMap() {
 
 HRESULT WINAPI Detour_CreateDevice(IDirect3D9* pD3D, UINT a, D3DDEVTYPE dt, HWND hw, DWORD b, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** r) {
     HRESULT hr = g_pfnOriginalCreateDevice(pD3D, a, dt, hw, b, pp, r);
-    if (SUCCEEDED(hr) && r && !g_bEndSceneHooked) {
-        g_hWindow = hw ? hw : (pp ? pp->hDeviceWindow : NULL);
-        void** vt = *(void***)*r;
-        MH_CreateHook((LPVOID)vt[42], &My_EndScene, (LPVOID*)&g_pfnOriginalEndScene);
-        MH_CreateHook((LPVOID)vt[16], &Detour_Reset, (LPVOID*)&g_pfnOriginalReset);
-        MH_EnableHook(MH_ALL_HOOKS);
-        g_bEndSceneHooked = true;
+    if (SUCCEEDED(hr) && r && *r) {
+        IDirect3DDevice9* createdDevice = *r;
+        std::call_once(g_DeviceHookOnce, [createdDevice]() {
+            void** vt = *(void***)createdDevice;
+            MH_CreateHook((LPVOID)vt[42], &My_EndScene, (LPVOID*)&g_pfnOriginalEndScene);
+            MH_CreateHook((LPVOID)vt[16], &Detour_Reset, (LPVOID*)&g_pfnOriginalReset);
+            MH_EnableHook(MH_ALL_HOOKS);
+        });
     }
     return hr;
 }
 
 IDirect3D9* WINAPI Detour_D3DCreate9(UINT v) {
     IDirect3D9* p = g_pfnOriginalDirect3DCreate9(v);
-    LoadBgmMap();
     if (p) {
         void** vt = *(void***)p;
         MH_CreateHook((LPVOID)vt[16], &Detour_CreateDevice, (LPVOID*)&g_pfnOriginalCreateDevice);
@@ -937,33 +1256,58 @@ IDirect3D9* WINAPI Detour_D3DCreate9(UINT v) {
     uintptr_t target = 0;
     if (g_Config.useRvaHook) target = (uintptr_t)GetModuleHandle(NULL) + g_Config.bgmFuncRVA;
     if (target) {
-        if (g_CurrentGame != GameID::XanaduNext) { g_bWorkerThreadActive = true; g_workerThread = std::thread(BgmWorkerThread); }
-        void* detourFunc = (g_CurrentGame == GameID::XanaduNext) ? (void*)Detour_Xanadu : (void*)Detour_Fopen;
-        void** originalFunc = (g_CurrentGame == GameID::XanaduNext) ? &g_pfnOriginalPlayBgm : &g_pfnOriginalInternalFopen;
-        if (MH_CreateHook((LPVOID)target, detourFunc, originalFunc) == MH_OK) MH_EnableHook((LPVOID)target);
+        if (g_CurrentGame != GameID::XanaduNext) {
+            if (!EnsureBgmWorkerStarted()) {
+                Log("RVA BGM hook skipped because the worker could not start.");
+                target = 0;
+            }
+        }
+        if (target) {
+            void* detourFunc = (g_CurrentGame == GameID::XanaduNext) ? (void*)Detour_Xanadu : (void*)Detour_Fopen;
+            void** originalFunc = (g_CurrentGame == GameID::XanaduNext) ? &g_pfnOriginalPlayBgm : &g_pfnOriginalInternalFopen;
+            if (MH_CreateHook((LPVOID)target, detourFunc, originalFunc) == MH_OK) MH_EnableHook((LPVOID)target);
+        }
     }
     MH_RemoveHook((LPVOID)g_pfnOriginalDirect3DCreate9);
     return p;
 }
 
 void InitializeHooks() {
+    // Process-lifetime proxy policy: callbacks and detached workers retain code
+    // addresses indefinitely. Pin after loader-lock exit; explicit dynamic
+    // unloading is intentionally unsupported and process shutdown owns handles.
+    if (!PinModuleForProcessLifetime()) {
+        Log("Failed to pin the proxy module; hooks were not installed.");
+        return;
+    }
+    g_WindowSubclass.Configure(
+        g_ModuleHandle,
+        WndProc,
+        kBgmInfoSubclassId
+    );
+
+    DetectAndConfigure();
+    LoadConfig();
+    LoadBgmMap();
+
+    HANDLE wakeEvent =
+        CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (wakeEvent) {
+        g_workerWakeEvent = wakeEvent;
+    } else {
+        Log(
+            "Failed to create the BGM worker event; "
+            "file and RVA BGM detection will remain disabled."
+        );
+    }
+
     MH_Initialize();
+    EnsureFileHooks();
+
     HMODULE d3d = GetModuleHandleA("d3d9.dll");
     while (!d3d) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); d3d = GetModuleHandleA("d3d9.dll"); }
     void* pC = (void*)GetProcAddress(d3d, "Direct3DCreate9");
     if (pC) { MH_CreateHook(pC, &Detour_D3DCreate9, (LPVOID*)&g_pfnOriginalDirect3DCreate9); MH_EnableHook(pC); }
-    HMODULE hU32 = GetModuleHandleA("user32.dll");
-    if (hU32) {
-        MH_CreateHook(GetProcAddress(hU32, "SetCursorPos"), &Detour_SetCursorPos, (LPVOID*)&g_pfnOriginalSetCursorPos);
-        MH_CreateHook(GetProcAddress(hU32, "ClipCursor"), &Detour_ClipCursor, (LPVOID*)&g_pfnOriginalClipCursor);
-        MH_CreateHook(GetProcAddress(hU32, "GetAsyncKeyState"), &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
-        MH_CreateHook(GetProcAddress(hU32, "GetKeyState"), &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
-        MH_CreateHook(GetProcAddress(hU32, "GetKeyboardState"), &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
-        MH_CreateHook(GetProcAddress(hU32, "PeekMessageA"), &Detour_PeekMessageA, (LPVOID*)&g_pfnOriginalPeekMessageA);
-        MH_CreateHook(GetProcAddress(hU32, "PeekMessageW"), &Detour_PeekMessageW, (LPVOID*)&g_pfnOriginalPeekMessageW);
-        MH_CreateHook(GetProcAddress(hU32, "GetMessageA"), &Detour_GetMessageA, (LPVOID*)&g_pfnOriginalGetMessageA);
-        MH_CreateHook(GetProcAddress(hU32, "GetMessageW"), &Detour_GetMessageW, (LPVOID*)&g_pfnOriginalGetMessageW);
-    }
     
     HMODULE hUcrt = GetModuleHandleA("ucrtbase.dll");
     if (hUcrt) {
@@ -980,12 +1324,14 @@ void InitializeHooks() {
 
 BOOL WINAPI DllMain(HMODULE h, DWORD r, LPVOID res) {
     if (r == DLL_PROCESS_ATTACH) {
+        g_ModuleHandle = h;
         g_modDirectory = ResolveModDirectory();
         DisableThreadLibraryCalls(h);
         DetectProxyType(h);
-        DetectAndConfigure();
-        LoadConfig();
         std::thread(InitializeHooks).detach();
-    } else if (r == DLL_PROCESS_DETACH) g_bWorkerThreadActive = false;
+    } else if (r == DLL_PROCESS_DETACH) {
+        g_bWorkerThreadActive = false;
+        SignalBgmWorker();
+    }
     return TRUE;
 }

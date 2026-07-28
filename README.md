@@ -33,7 +33,7 @@ It is designed to be lightweight, compatible with Steam Deck/Linux, and requires
 * **The Legend of Heroes: Trails in the Sky FC** (Original DX9 Version)
 * **The Legend of Heroes: Trails in the Sky SC** (Original DX9 Version)
 * **The Legend of Heroes: Trails in the Sky the 3rd** (Original DX9 Version)
-* **Zwei II** (soon!)
+* **Zwei II** 
 
 ---
 

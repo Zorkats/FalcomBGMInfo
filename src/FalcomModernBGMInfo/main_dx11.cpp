@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <windows.h>
+#include <commctrl.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi.lib")
 #include <psapi.h>
@@ -15,6 +16,7 @@
 #include <string>
 #include <fstream>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <sstream>
 #include <thread>
@@ -29,6 +31,9 @@
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
+#include "bgm_path_utils.h"
+#include "owner_thread_subclass.h"
+#include "synchronized_snapshot.h"
 
 extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam); // I don't know why it doesn't compile without this even though imgui_impl_win32.h and .cpp are included.
 
@@ -63,9 +68,12 @@ struct ModConfig {
 };
 
 GameConfig g_Config;
-ModConfig g_ModConfig;
+SynchronizedSnapshot<ModConfig> g_ModConfig;
 GameID g_CurrentGame = GameID::Unknown;
 static std::mutex g_LogMutex;
+static std::mutex g_ConfigSaveMutex;
+static HANDLE g_LogFileHandle = INVALID_HANDLE_VALUE;
+static HMODULE g_ModuleHandle = nullptr;
 
 // =============================================================
 // LOGGING & UTILS
@@ -79,16 +87,74 @@ std::string GetModDirectory() {
     return std::string(path);
 }
 
+HANDLE GetLogFileHandleLocked() {
+    if (g_LogFileHandle != INVALID_HANDLE_VALUE) {
+        return g_LogFileHandle;
+    }
+
+    const std::string path = GetModDirectory() + "\\mod_log.txt";
+    g_LogFileHandle = CreateFileA(
+        path.c_str(),
+        FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+    return g_LogFileHandle;
+}
+
 void Log(const std::string& message) {
     std::lock_guard<std::mutex> lock(g_LogMutex);
-    std::string path = GetModDirectory() + "\\mod_log.txt";
-    std::ofstream log_file(path, std::ios_base::app | std::ios_base::out);
+    HANDLE logFile = GetLogFileHandleLocked();
+    if (logFile == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
     auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     char time_str[26];
     ctime_s(time_str, sizeof(time_str), &time);
     time_str[24] = '\0';
-    log_file << "[" << time_str << "] " << message << std::endl;
+
+    DWORD bytesWritten = 0;
+    WriteFile(logFile, "[", 1, &bytesWritten, nullptr);
+    WriteFile(logFile, time_str, 24, &bytesWritten, nullptr);
+    WriteFile(logFile, "] ", 2, &bytesWritten, nullptr);
+    WriteFile(logFile, message.data(), static_cast<DWORD>(message.size()), &bytesWritten, nullptr);
+    WriteFile(logFile, "\r\n", 2, &bytesWritten, nullptr);
 }
+
+void FlushLog() {
+    std::lock_guard<std::mutex> lock(g_LogMutex);
+    if (g_LogFileHandle != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(g_LogFileHandle);
+    }
+}
+
+bool PinModuleForProcessLifetime() {
+    HMODULE pinnedModule = nullptr;
+    const BOOL pinned = GetModuleHandleExA(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCSTR>(&PinModuleForProcessLifetime),
+        &pinnedModule
+    );
+    if (pinned) {
+        g_ModuleHandle = pinnedModule;
+    }
+    return pinned != FALSE;
+}
+
+struct CoInitializeScope {
+    bool initialized = false;
+
+    ~CoInitializeScope() {
+        if (initialized) {
+            CoUninitialize();
+        }
+    }
+};
 
 void WCharToString(const WCHAR* wstr, char* buffer, size_t bufferSize) {
     if (!wstr || !buffer) return;
@@ -98,18 +164,29 @@ void WCharToString(const WCHAR* wstr, char* buffer, size_t bufferSize) {
 void SaveConfig() {
     std::string path = GetModDirectory() + "\\mod_config.yaml";
     try {
-        YAML::Emitter out;
-        out << YAML::BeginMap;
-        out << YAML::Key << "IgnoreCooldown" << YAML::Value << g_ModConfig.ignoreCooldown;
-        out << YAML::Key << "ShowHotkey" << YAML::Value << g_ModConfig.showHotkey;
-        out << YAML::Key << "MenuHotkey" << YAML::Value << g_ModConfig.menuHotkey;
-        out << YAML::Key << "ToastDuration" << YAML::Value << g_ModConfig.toastDuration;
-        out << YAML::Key << "CooldownHours" << YAML::Value << g_ModConfig.cooldownHours;
-        out << YAML::Key << "ShowJapanese" << YAML::Value << g_ModConfig.showJapanese;
-        out << YAML::Key << "UIScale" << YAML::Value << g_ModConfig.uiScale;
-        out << YAML::EndMap;
-        std::ofstream fout(path);
-        fout << out.c_str();
+        {
+            std::lock_guard<std::mutex> lock(g_ConfigSaveMutex);
+            const ModConfig config = g_ModConfig.Load();
+            YAML::Emitter out;
+            out << YAML::BeginMap;
+            out << YAML::Key << "IgnoreCooldown" << YAML::Value << config.ignoreCooldown;
+            out << YAML::Key << "ShowHotkey" << YAML::Value << config.showHotkey;
+            out << YAML::Key << "MenuHotkey" << YAML::Value << config.menuHotkey;
+            out << YAML::Key << "ToastDuration" << YAML::Value << config.toastDuration;
+            out << YAML::Key << "CooldownHours" << YAML::Value << config.cooldownHours;
+            out << YAML::Key << "ShowJapanese" << YAML::Value << config.showJapanese;
+            out << YAML::Key << "UIScale" << YAML::Value << config.uiScale;
+            out << YAML::EndMap;
+            const std::string serializedConfig = out.c_str();
+            std::ofstream fout(
+                path,
+                std::ios::out | std::ios::trunc
+            );
+            fout.exceptions(
+                std::ios::failbit | std::ios::badbit
+            );
+            fout << serializedConfig;
+        }
         Log("Config saved to: " + path);
     } catch (const std::exception& e) {
         Log("Failed to save config: " + std::string(e.what()));
@@ -126,14 +203,16 @@ void LoadConfig() {
     }
     try {
         YAML::Node config = YAML::Load(fin);
-        if (config["IgnoreCooldown"]) g_ModConfig.ignoreCooldown = config["IgnoreCooldown"].as<bool>();
-        if (config["AlwaysShow"]) g_ModConfig.ignoreCooldown = config["AlwaysShow"].as<bool>(); // Legacy support
-        if (config["ShowHotkey"]) g_ModConfig.showHotkey = config["ShowHotkey"].as<int>();
-        if (config["MenuHotkey"]) g_ModConfig.menuHotkey = config["MenuHotkey"].as<int>();
-        if (config["ToastDuration"]) g_ModConfig.toastDuration = config["ToastDuration"].as<float>();
-        if (config["CooldownHours"]) g_ModConfig.cooldownHours = config["CooldownHours"].as<int>();
-        if (config["ShowJapanese"]) g_ModConfig.showJapanese = config["ShowJapanese"].as<bool>();
-        if (config["UIScale"]) g_ModConfig.uiScale = config["UIScale"].as<float>();
+        ModConfig loadedConfig = g_ModConfig.Load();
+        if (config["IgnoreCooldown"]) loadedConfig.ignoreCooldown = config["IgnoreCooldown"].as<bool>();
+        if (config["AlwaysShow"]) loadedConfig.ignoreCooldown = config["AlwaysShow"].as<bool>(); // Legacy support
+        if (config["ShowHotkey"]) loadedConfig.showHotkey = config["ShowHotkey"].as<int>();
+        if (config["MenuHotkey"]) loadedConfig.menuHotkey = config["MenuHotkey"].as<int>();
+        if (config["ToastDuration"]) loadedConfig.toastDuration = config["ToastDuration"].as<float>();
+        if (config["CooldownHours"]) loadedConfig.cooldownHours = config["CooldownHours"].as<int>();
+        if (config["ShowJapanese"]) loadedConfig.showJapanese = config["ShowJapanese"].as<bool>();
+        if (config["UIScale"]) loadedConfig.uiScale = config["UIScale"].as<float>();
+        g_ModConfig.Store(loadedConfig);
         Log("Config loaded from: " + path);
     } catch (const std::exception& e) {
         Log("Failed to load config: " + std::string(e.what()));
@@ -254,7 +333,7 @@ void DetectAndConfigure() {
             g_Config.gameName = "Trails in the Sky (Remake)";
             g_Config.windowTitlePart = "Trails in the Sky";
             g_Config.yamlFiles.push_back("BgmMap_Sky.yaml");
-            g_Config.soundManagerRVA = 0x57B440;
+            g_Config.soundManagerRVA = 0x580F50;
             break;
         default:
             g_Config.gameName = "Unknown Game";
@@ -289,14 +368,30 @@ static float g_toastTimer = 0.0f;
 static float g_toastCurrentX = -10000.0f;
 static float g_lastDisplayWidth = 0.0f;
 static float g_lastDisplayHeight = 0.0f;
+static float g_backBufferWidth = 0.0f;
+static float g_backBufferHeight = 0.0f;
+static IDXGISwapChain* g_pBackBufferSizeSwapChain = nullptr;
+static uint64_t g_backBufferSizeGeneration = 0;
 
-static bool g_imguiInitialized = false;
-static bool g_showMenu = false;
+static std::atomic<bool> g_imguiInitialized = false;
+static std::atomic<bool> g_showMenu = false;
 static bool g_isRemapping = false;
+static std::recursive_mutex g_RendererMutex;
 static HWND g_hWindow = nullptr;
+static IDXGISwapChain* g_pRendererSwapChain = nullptr;
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static ID3D11RenderTargetView* g_pd3dRenderTargetView = nullptr;
+static IDXGISwapChain* g_pRenderTargetSwapChain = nullptr;
+static std::mutex g_RenderTargetMutex;
+static std::atomic<bool> g_canCacheRenderTarget = false;
+static std::atomic<bool> g_resizeInProgress = false;
+static std::atomic<uint64_t> g_renderTargetGeneration = 0;
+static uint64_t g_cachedRenderTargetGeneration = 0;
+static bool g_win32BackendInitialized = false;
+static bool g_dx11BackendInitialized = false;
+static constexpr UINT_PTR kBgmInfoSubclassId = 0x4642474D;
+static bgm_window::OwnerThreadSubclass g_WindowSubclass;
 static ImFont* g_pMenuFont = nullptr;
 static ImFont* g_pToastFont = nullptr;
 static ID3D11ShaderResourceView* g_pToastTexture = nullptr;
@@ -308,225 +403,8 @@ static std::mutex g_bufferMutex;
 static char g_bgmFilenameBuffer[MAX_PATH];
 static std::atomic<bool> g_bNewBgmAvailable = false;
 static std::atomic<bool> g_bWorkerThreadActive = true;
-
-// =============================================================
-// INPUT BLOCKING DETOURS
-// =============================================================
-typedef SHORT(WINAPI* PFN_GETASYNCKEYSTATE)(int);
-static PFN_GETASYNCKEYSTATE g_pfnOriginalGetAsyncKeyState = nullptr;
-SHORT WINAPI Detour_GetAsyncKeyState(int vKey) {
-    if (g_showMenu && !g_isRemapping) return 0;
-    return g_pfnOriginalGetAsyncKeyState(vKey);
-}
-
-typedef SHORT(WINAPI* PFN_GETKEYSTATE)(int);
-static PFN_GETKEYSTATE g_pfnOriginalGetKeyState = nullptr;
-SHORT WINAPI Detour_GetKeyState(int nVirtKey) {
-    if (g_showMenu && !g_isRemapping) return 0;
-    return g_pfnOriginalGetKeyState(nVirtKey);
-}
-
-typedef BOOL(WINAPI* PFN_GETKEYBOARDSTATE)(PBYTE);
-static PFN_GETKEYBOARDSTATE g_pfnOriginalGetKeyboardState = nullptr;
-BOOL WINAPI Detour_GetKeyboardState(PBYTE lpKeyState) {
-    if (g_showMenu && !g_isRemapping && lpKeyState) {
-        memset(lpKeyState, 0, 256);
-        return TRUE;
-    }
-    return g_pfnOriginalGetKeyboardState(lpKeyState);
-}
-
-typedef BOOL(WINAPI* PFN_SETCURSORPOS)(int, int);
-static PFN_SETCURSORPOS g_pfnOriginalSetCursorPos = nullptr;
-BOOL WINAPI Detour_SetCursorPos(int X, int Y) {
-    if (g_showMenu && !g_isRemapping) return TRUE;
-    return g_pfnOriginalSetCursorPos(X, Y);
-}
-
-typedef BOOL(WINAPI* PFN_CLIPCURSOR)(const RECT*);
-static PFN_CLIPCURSOR g_pfnOriginalClipCursor = nullptr;
-BOOL WINAPI Detour_ClipCursor(const RECT* lpRect) {
-    if (g_showMenu && !g_isRemapping) return TRUE;
-    return g_pfnOriginalClipCursor(lpRect);
-}
-
-// Aggressive Message Blocking
-typedef BOOL(WINAPI* PFN_PEEKMESSAGEA)(LPMSG, HWND, UINT, UINT, UINT);
-typedef BOOL(WINAPI* PFN_PEEKMESSAGEW)(LPMSG, HWND, UINT, UINT, UINT);
-typedef BOOL(WINAPI* PFN_GETMESSAGEA)(LPMSG, HWND, UINT, UINT);
-typedef BOOL(WINAPI* PFN_GETMESSAGEW)(LPMSG, HWND, UINT, UINT);
-static PFN_PEEKMESSAGEA g_pfnOriginalPeekMessageA = nullptr;
-static PFN_PEEKMESSAGEW g_pfnOriginalPeekMessageW = nullptr;
-static PFN_GETMESSAGEA g_pfnOriginalGetMessageA = nullptr;
-static PFN_GETMESSAGEW g_pfnOriginalGetMessageW = nullptr;
-
-BOOL WINAPI Detour_PeekMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL res = g_pfnOriginalPeekMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_PeekMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax, UINT wRemoveMsg) {
-    BOOL res = g_pfnOriginalPeekMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_GetMessageA(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL res = g_pfnOriginalGetMessageA(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-BOOL WINAPI Detour_GetMessageW(LPMSG lpMsg, HWND hWnd, UINT wMsgFilterMin, UINT wMsgFilterMax) {
-    BOOL res = g_pfnOriginalGetMessageW(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax);
-    if (res && g_showMenu && lpMsg) {
-        if (lpMsg->message == WM_KEYDOWN || lpMsg->message == WM_SYSKEYDOWN) {
-            if (lpMsg->wParam == (WPARAM)g_ModConfig.menuHotkey) return res;
-        }
-        if (!g_isRemapping) {
-            if ((lpMsg->message >= WM_MOUSEFIRST && lpMsg->message <= WM_MOUSELAST) || (lpMsg->message >= WM_KEYFIRST && lpMsg->message <= WM_KEYLAST) || lpMsg->message == WM_INPUT || lpMsg->message == WM_CHAR) {
-                ImGui_ImplWin32_WndProcHandler(lpMsg->hwnd, lpMsg->message, lpMsg->wParam, lpMsg->lParam);
-                lpMsg->message = WM_NULL;
-            }
-        }
-    }
-    return res;
-}
-
-// =============================================================
-// D3D11 STATE SAVER
-// =============================================================
-struct D3D11StateSaver {
-    bool m_saved;
-    D3D_FEATURE_LEVEL m_featureLevel;
-    ID3D11DeviceContext* m_pContext;
-    D3D11_PRIMITIVE_TOPOLOGY m_primitiveTopology;
-    ID3D11InputLayout* m_pInputLayout;
-    ID3D11BlendState* m_pBlendState;
-    float m_blendFactor[4];
-    UINT m_sampleMask;
-    ID3D11DepthStencilState* m_pDepthStencilState;
-    UINT m_stencilRef;
-    ID3D11RasterizerState* m_pRasterizerState;
-    ID3D11ShaderResourceView* m_pPSShaderResource;
-    ID3D11SamplerState* m_pPSSampler;
-    ID3D11PixelShader* m_pPS;
-    ID3D11VertexShader* m_pVS;
-    ID3D11GeometryShader* m_pGS;
-    UINT m_numViewports;
-    D3D11_VIEWPORT m_viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    ID3D11RenderTargetView* m_pRenderTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-    ID3D11DepthStencilView* m_pDepthStencilView;
-
-    explicit D3D11StateSaver(ID3D11DeviceContext* pContext)
-        : m_saved(false)
-        , m_featureLevel(D3D_FEATURE_LEVEL_11_0)
-        , m_pContext(pContext)
-        , m_primitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED)
-        , m_pInputLayout(nullptr)
-        , m_pBlendState(nullptr)
-        , m_sampleMask(0)
-        , m_pDepthStencilState(nullptr)
-        , m_stencilRef(0)
-        , m_pRasterizerState(nullptr)
-        , m_pPSShaderResource(nullptr)
-        , m_pPSSampler(nullptr)
-        , m_pPS(nullptr)
-        , m_pVS(nullptr)
-        , m_pGS(nullptr)
-        , m_numViewports(0)
-        , m_pDepthStencilView(nullptr)
-    {
-        memset(m_blendFactor, 0, sizeof(m_blendFactor));
-        memset(m_viewports, 0, sizeof(m_viewports));
-        for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-            m_pRenderTargets[i] = nullptr;
-
-        if (m_pContext) saveCurrentState();
-    }
-
-    ~D3D11StateSaver() {
-        restoreSavedState();
-        releaseSavedState();
-    }
-
-    void saveCurrentState() {
-        if (!m_pContext) return;
-        m_pContext->IAGetPrimitiveTopology(&m_primitiveTopology);
-        m_pContext->IAGetInputLayout(&m_pInputLayout);
-        m_pContext->OMGetBlendState(&m_pBlendState, m_blendFactor, &m_sampleMask);
-        m_pContext->OMGetDepthStencilState(&m_pDepthStencilState, &m_stencilRef);
-        m_pContext->RSGetState(&m_pRasterizerState);
-        m_numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-        m_pContext->RSGetViewports(&m_numViewports, m_viewports);
-        m_pContext->PSGetShaderResources(0, 1, &m_pPSShaderResource);
-        m_pContext->PSGetSamplers(0, 1, &m_pPSSampler);
-        m_pContext->PSGetShader(&m_pPS, NULL, NULL);
-        m_pContext->VSGetShader(&m_pVS, NULL, NULL);
-        m_pContext->GSGetShader(&m_pGS, NULL, NULL);
-        m_pContext->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, m_pRenderTargets, &m_pDepthStencilView);
-        m_saved = true;
-    }
-
-    void restoreSavedState() {
-        if (!m_saved || !m_pContext) return;
-        m_pContext->IASetPrimitiveTopology(m_primitiveTopology);
-        m_pContext->IASetInputLayout(m_pInputLayout);
-        m_pContext->OMSetBlendState(m_pBlendState, m_blendFactor, m_sampleMask);
-        m_pContext->OMSetDepthStencilState(m_pDepthStencilState, m_stencilRef);
-        m_pContext->RSSetState(m_pRasterizerState);
-        m_pContext->RSSetViewports(m_numViewports, m_viewports);
-        m_pContext->PSSetShaderResources(0, 1, &m_pPSShaderResource);
-        m_pContext->PSSetSamplers(0, 1, &m_pPSSampler);
-        m_pContext->PSSetShader(m_pPS, NULL, NULL);
-        m_pContext->VSSetShader(m_pVS, NULL, NULL);
-        m_pContext->GSSetShader(m_pGS, NULL, NULL);
-        m_pContext->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, m_pRenderTargets, m_pDepthStencilView);
-    }
-
-    void releaseSavedState() {
-        if (m_pInputLayout) m_pInputLayout->Release();
-        if (m_pBlendState) m_pBlendState->Release();
-        if (m_pDepthStencilState) m_pDepthStencilState->Release();
-        if (m_pRasterizerState) m_pRasterizerState->Release();
-        if (m_pPSShaderResource) m_pPSShaderResource->Release();
-        if (m_pPSSampler) m_pPSSampler->Release();
-        if (m_pPS) m_pPS->Release();
-        if (m_pVS) m_pVS->Release();
-        if (m_pGS) m_pGS->Release();
-        if (m_pDepthStencilView) m_pDepthStencilView->Release();
-        for (int i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-            if (m_pRenderTargets[i]) m_pRenderTargets[i]->Release();
-    }
-};
+static std::atomic<HANDLE> g_workerWakeEvent = nullptr;
+static std::atomic<bool> g_shutdownRequested = false;
 
 // =============================================================
 // YAML PARSER
@@ -573,7 +451,7 @@ void LoadMapFile(const std::string& filename) {
             }
 
             if (info.japaneseName == info.songName || info.japaneseName == " ") info.japaneseName = "";
-            g_bgmMap[filepath] = info;
+            g_bgmMap[bgm_path::NormalizeLookupPath(filepath)] = info;
         }
         Log("Loaded: " + filename);
     } catch (const YAML::Exception& e) {
@@ -592,116 +470,453 @@ void LoadBgmMap() {
 // =============================================================
 typedef HRESULT(WINAPI* PFN_PRESENT)(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags);
 static PFN_PRESENT g_pfnOriginalPresent = nullptr;
-static WNDPROC g_pfnOriginalWndProc = NULL;
+typedef HRESULT(WINAPI* PFN_RESIZEBUFFERS)(IDXGISwapChain* pSwapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags);
+static PFN_RESIZEBUFFERS g_pfnOriginalResizeBuffers = nullptr;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-LRESULT WINAPI WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+void ReleaseRenderTargetLocked() {
+    if (g_pd3dRenderTargetView) {
+        g_pd3dRenderTargetView->Release();
+        g_pd3dRenderTargetView = nullptr;
+    }
+    g_pRenderTargetSwapChain = nullptr;
+    g_cachedRenderTargetGeneration = 0;
+}
+
+HRESULT CreateRenderTargetView(
+    IDXGISwapChain* pSwapChain,
+    ID3D11Device* device,
+    ID3D11RenderTargetView** renderTargetView
+) {
+    if (!pSwapChain || !device || !renderTargetView) {
+        return E_INVALIDARG;
+    }
+
+    *renderTargetView = nullptr;
+    ID3D11Texture2D* backBuffer = nullptr;
+    HRESULT result = pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer));
+    if (FAILED(result)) {
+        return result;
+    }
+
+    result = device->CreateRenderTargetView(backBuffer, nullptr, renderTargetView);
+    backBuffer->Release();
+    return result;
+}
+
+bool UpdateBackBufferSizeLocked(IDXGISwapChain* pSwapChain) {
+    if (!pSwapChain || g_resizeInProgress.load()) {
+        return false;
+    }
+
+    const uint64_t generation =
+        g_renderTargetGeneration.load();
+    ID3D11Texture2D* backBuffer = nullptr;
+    const HRESULT result = pSwapChain->GetBuffer(
+        0,
+        __uuidof(ID3D11Texture2D),
+        reinterpret_cast<void**>(&backBuffer)
+    );
+    if (FAILED(result) || !backBuffer) {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC description = {};
+    backBuffer->GetDesc(&description);
+    backBuffer->Release();
+    if (g_resizeInProgress.load() ||
+        generation != g_renderTargetGeneration.load() ||
+        description.Width == 0 ||
+        description.Height == 0) {
+        return false;
+    }
+
+    g_backBufferWidth =
+        static_cast<float>(description.Width);
+    g_backBufferHeight =
+        static_cast<float>(description.Height);
+    g_pBackBufferSizeSwapChain = pSwapChain;
+    g_backBufferSizeGeneration = generation;
+    return true;
+}
+
+bool EnsureCachedRenderTargetLocked(IDXGISwapChain* pSwapChain) {
+    if (g_resizeInProgress.load()) {
+        return false;
+    }
+
+    const uint64_t generation = g_renderTargetGeneration.load();
+    if (g_pd3dRenderTargetView &&
+        g_pRenderTargetSwapChain == pSwapChain &&
+        g_cachedRenderTargetGeneration == generation) {
+        return true;
+    }
+
+    ReleaseRenderTargetLocked();
+    ID3D11RenderTargetView* renderTargetView = nullptr;
+    if (FAILED(CreateRenderTargetView(pSwapChain, g_pd3dDevice, &renderTargetView))) {
+        return false;
+    }
+
+    if (g_resizeInProgress.load() || generation != g_renderTargetGeneration.load()) {
+        renderTargetView->Release();
+        return false;
+    }
+
+    g_pd3dRenderTargetView = renderTargetView;
+    g_pRenderTargetSwapChain = pSwapChain;
+    g_cachedRenderTargetGeneration = generation;
+    return true;
+}
+
+LRESULT CALLBACK WndProc(
+    HWND hWnd,
+    UINT uMsg,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR referenceData
+) {
+    static_cast<void>(subclassId);
+    static_cast<void>(referenceData);
+    if (g_WindowSubclass.HandleControlMessage(hWnd, uMsg)) {
+        return 0;
+    }
+    if (uMsg == WM_NCDESTROY) {
+        g_imguiInitialized = false;
+        g_WindowSubclass.NotifyDestroyed(hWnd);
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+    }
+
+    const ModConfig config = g_ModConfig.Load();
     if (uMsg == WM_KEYDOWN) {
-        if (wParam == g_ModConfig.menuHotkey) {
-            g_showMenu = !g_showMenu;
-            ImGuiIO& io = ImGui::GetIO();
-            if (g_showMenu) {
-                io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
-                io.ConfigFlags &= ~ImGuiConfigFlags_NoKeyboard;
-                io.MouseDrawCursor = true;
-            } else {
-                io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
-                io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
-                io.MouseDrawCursor = false;
+        if (wParam == config.menuHotkey) {
+            const bool showMenu = !g_showMenu.load();
+            g_showMenu = showMenu;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+                if (g_imguiInitialized.load() && ImGui::GetCurrentContext()) {
+                    ImGuiIO& io = ImGui::GetIO();
+                    if (showMenu) {
+                        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+                        io.ConfigFlags &= ~ImGuiConfigFlags_NoKeyboard;
+                        io.MouseDrawCursor = true;
+                    } else {
+                        io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
+                        io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
+                        io.MouseDrawCursor = false;
+                    }
+                }
+            }
+            if (!showMenu) {
                 SaveConfig();
             }
             return 0;
         }
-        if (wParam == g_ModConfig.showHotkey && !g_showMenu) {
-            g_toastTimer = g_ModConfig.toastDuration;
+        if (wParam == config.showHotkey && !g_showMenu.load()) {
+            std::lock_guard<std::mutex> lock(g_BgmMutex);
+            g_toastTimer = config.toastDuration;
             g_toastCurrentX = -10000.0f;
             return 0;
         }
     }
 
-    if (g_showMenu) {
-        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
-        if (!g_isRemapping) {
-            // Block mouse and keyboard inputs from reaching the game while menu is open
-            if ((uMsg >= WM_MOUSEFIRST && uMsg <= WM_MOUSELAST) ||
-                (uMsg >= WM_KEYFIRST && uMsg <= WM_KEYLAST) ||
-                uMsg == WM_INPUT) {
-                return 1;
-            }
+    if (g_showMenu.load()) {
+        std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+        if (g_imguiInitialized.load()) {
+            ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
         }
-    } else {
-        ImGui_ImplWin32_WndProcHandler(hWnd, uMsg, wParam, lParam);
     }
 
-    return CallWindowProc(g_pfnOriginalWndProc, hWnd, uMsg, wParam, lParam);
+    // Keep the window-procedure chain intact so other overlays can observe their input.
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
-void InitImGui(IDXGISwapChain* pSwapChain) {
-    if (g_imguiInitialized) return;
-
-    Log("InitImGui starting...");
-
-    if (!g_hWindow) {
-        DXGI_SWAP_CHAIN_DESC desc;
-        if (SUCCEEDED(pSwapChain->GetDesc(&desc))) {
-            g_hWindow = desc.OutputWindow;
+HRESULT WINAPI My_ResizeBuffers(
+    IDXGISwapChain* pSwapChain,
+    UINT BufferCount,
+    UINT Width,
+    UINT Height,
+    DXGI_FORMAT NewFormat,
+    UINT SwapChainFlags
+) {
+    g_resizeInProgress = true;
+    g_renderTargetGeneration.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(g_RenderTargetMutex);
+        if (pSwapChain == g_pRenderTargetSwapChain) {
+            ReleaseRenderTargetLocked();
         }
     }
 
-    if (!g_hWindow) {
-        Log("ERROR: No valid window handle, skipping initialization");
+    HRESULT result = g_pfnOriginalResizeBuffers(
+        pSwapChain,
+        BufferCount,
+        Width,
+        Height,
+        NewFormat,
+        SwapChainFlags
+    );
+    g_renderTargetGeneration.fetch_add(1);
+    g_resizeInProgress = false;
+    return result;
+}
+
+bool HasRendererResourcesLocked() {
+    return
+        g_pRendererSwapChain ||
+        g_pd3dDevice ||
+        g_pd3dDeviceContext ||
+        g_win32BackendInitialized ||
+        g_dx11BackendInitialized ||
+        ImGui::GetCurrentContext();
+}
+
+void LogSubclassFailureLocked() {
+    bgm_window::SubclassPhase failedPhase;
+    DWORD errorCode = ERROR_SUCCESS;
+    if (!g_WindowSubclass.ConsumeFailure(failedPhase, errorCode)) {
         return;
     }
 
-    if (SUCCEEDED(pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_pd3dDevice))) {
-        g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
-        g_pfnOriginalWndProc = (WNDPROC)SetWindowLongPtr(g_hWindow, GWLP_WNDPROC, (LONG_PTR)WndProc);
+    const char* operation =
+        failedPhase == bgm_window::SubclassPhase::RemoveFailed
+            ? "removal"
+            : "installation";
+    Log(
+        std::string("Owner-thread window subclass ") +
+        operation +
+        " failed with Win32 error " +
+        std::to_string(errorCode) +
+        ". The operation will not be retried for this window."
+    );
+}
 
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        io.IniFilename = NULL;
+void FinalizeRendererShutdownLocked() {
+    g_imguiInitialized = false;
 
+    {
+        std::lock_guard<std::mutex> lock(g_RenderTargetMutex);
+        ReleaseRenderTargetLocked();
+    }
+
+    if (g_dx11BackendInitialized) {
+        ImGui_ImplDX11_Shutdown();
+        g_dx11BackendInitialized = false;
+    }
+    if (g_win32BackendInitialized) {
+        ImGui_ImplWin32_Shutdown();
+        g_win32BackendInitialized = false;
+    }
+
+    if (g_pToastTexture) {
+        g_pToastTexture->Release();
+        g_pToastTexture = nullptr;
+    }
+    if (g_pToastResource) {
+        g_pToastResource->Release();
+        g_pToastResource = nullptr;
+    }
+
+    if (ImGui::GetCurrentContext()) {
+        ImGui::DestroyContext();
+    }
+
+    g_pMenuFont = nullptr;
+    g_pToastFont = nullptr;
+    g_TextureWidth = 0.0f;
+    g_TextureHeight = 0.0f;
+    g_lastDisplayWidth = 0.0f;
+    g_lastDisplayHeight = 0.0f;
+    g_backBufferWidth = 0.0f;
+    g_backBufferHeight = 0.0f;
+    g_pBackBufferSizeSwapChain = nullptr;
+    g_backBufferSizeGeneration = 0;
+    g_hWindow = nullptr;
+
+    if (g_pd3dDeviceContext) {
+        g_pd3dDeviceContext->Release();
+        g_pd3dDeviceContext = nullptr;
+    }
+    if (g_pd3dDevice) {
+        g_pd3dDevice->Release();
+        g_pd3dDevice = nullptr;
+    }
+    if (g_pRendererSwapChain) {
+        g_pRendererSwapChain->Release();
+        g_pRendererSwapChain = nullptr;
+    }
+}
+
+bool ShutdownRendererLocked() {
+    g_imguiInitialized = false;
+
+    const bgm_window::SubclassPhase phase = g_WindowSubclass.Phase();
+    if (phase == bgm_window::SubclassPhase::Installed ||
+        phase == bgm_window::SubclassPhase::InstallQueued) {
+        g_WindowSubclass.RequestRemove();
+    }
+
+    LogSubclassFailureLocked();
+    if (!g_WindowSubclass.CanDisposeRenderer()) {
+        return false;
+    }
+
+    if (HasRendererResourcesLocked()) {
+        FinalizeRendererShutdownLocked();
+    }
+    return true;
+}
+
+bool CompleteRendererActivationLocked() {
+    if (g_WindowSubclass.IsInstalledFor(
+            g_hWindow,
+            reinterpret_cast<std::uintptr_t>(
+                g_pRendererSwapChain))) {
+        if (!g_imguiInitialized.exchange(true)) {
+            Log("Renderer initialization finished successfully.");
+        }
+        return true;
+    }
+
+    LogSubclassFailureLocked();
+    if (g_WindowSubclass.CanDisposeRenderer() &&
+        HasRendererResourcesLocked()) {
+        FinalizeRendererShutdownLocked();
+    }
+    return false;
+}
+
+bool InitializeRendererLocked(IDXGISwapChain* pSwapChain, ID3D11Device* device) {
+    if (!pSwapChain || !device) {
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+    if (FAILED(pSwapChain->GetDesc(&swapChainDesc)) || !swapChainDesc.OutputWindow) {
+        Log("ERROR: No valid window handle, skipping renderer initialization");
+        return false;
+    }
+
+    Log("Renderer initialization starting...");
+    g_hWindow = swapChainDesc.OutputWindow;
+    g_pRendererSwapChain = pSwapChain;
+    g_pRendererSwapChain->AddRef();
+    g_pd3dDevice = device;
+    g_pd3dDevice->AddRef();
+    g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
+    if (!g_pd3dDeviceContext) {
+        FinalizeRendererShutdownLocked();
+        return false;
+    }
+
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;
+    if (g_showMenu.load()) {
+        io.MouseDrawCursor = true;
+    } else {
         io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
         io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
-
-        std::string f1 = GetModDirectory() + "\\assets\\mod_font.otf";
-        std::string f2 = GetModDirectory() + "\\assets\\mod_font_japanese.ttf";
-        const ImWchar* ranges = io.Fonts->GetGlyphRangesJapanese();
-
-        g_pMenuFont = io.Fonts->AddFontFromFileTTF(f1.c_str(), 18.0f);
-        if (g_pMenuFont) {
-            ImFontConfig cfg1;
-            cfg1.MergeMode = true;
-            io.Fonts->AddFontFromFileTTF(f2.c_str(), 18.0f, &cfg1, ranges);
-        }
-
-        g_pToastFont = io.Fonts->AddFontFromFileTTF(f1.c_str(), 28.0f);
-        if (g_pToastFont) {
-            ImFontConfig cfg2;
-            cfg2.MergeMode = true;
-            io.Fonts->AddFontFromFileTTF(f2.c_str(), 28.0f, &cfg2, ranges);
-        }
-        io.Fonts->Build();
-
-        std::string texStr = GetModDirectory() + "\\assets\\bgm_info.dds";
-        std::wstring texW(texStr.begin(), texStr.end());
-        HRESULT hr = DirectX::CreateDDSTextureFromFile(g_pd3dDevice, texW.c_str(), &g_pToastResource, &g_pToastTexture);
-        if (SUCCEEDED(hr) && g_pToastResource) {
-            ID3D11Texture2D* pTex = nullptr;
-            if (SUCCEEDED(g_pToastResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTex))) {
-                D3D11_TEXTURE2D_DESC desc;
-                pTex->GetDesc(&desc);
-                g_TextureWidth = (float)desc.Width;
-                g_TextureHeight = (float)desc.Height;
-                pTex->Release();
-            }
-        }
-
-        ImGui_ImplWin32_Init(g_hWindow);
-        ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-        g_imguiInitialized = true;
-        Log("InitImGui finished successfully.");
+        io.MouseDrawCursor = false;
     }
+
+    const std::string modDirectory = GetModDirectory();
+    const std::string primaryFont = modDirectory + "\\assets\\mod_font.otf";
+    const std::string japaneseFont = modDirectory + "\\assets\\mod_font_japanese.ttf";
+    const ImWchar* ranges = io.Fonts->GetGlyphRangesJapanese();
+
+    g_pMenuFont = io.Fonts->AddFontFromFileTTF(primaryFont.c_str(), 18.0f);
+    if (g_pMenuFont) {
+        ImFontConfig menuFontConfig;
+        menuFontConfig.MergeMode = true;
+        io.Fonts->AddFontFromFileTTF(japaneseFont.c_str(), 18.0f, &menuFontConfig, ranges);
+    }
+
+    g_pToastFont = io.Fonts->AddFontFromFileTTF(primaryFont.c_str(), 28.0f);
+    if (g_pToastFont) {
+        ImFontConfig toastFontConfig;
+        toastFontConfig.MergeMode = true;
+        io.Fonts->AddFontFromFileTTF(japaneseFont.c_str(), 28.0f, &toastFontConfig, ranges);
+    }
+    io.Fonts->Build();
+
+    const std::string texturePath = modDirectory + "\\assets\\bgm_info.dds";
+    const std::wstring texturePathWide(texturePath.begin(), texturePath.end());
+    HRESULT textureResult = DirectX::CreateDDSTextureFromFile(
+        g_pd3dDevice,
+        texturePathWide.c_str(),
+        &g_pToastResource,
+        &g_pToastTexture
+    );
+    if (SUCCEEDED(textureResult) && g_pToastResource) {
+        ID3D11Texture2D* texture = nullptr;
+        if (SUCCEEDED(g_pToastResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture)))) {
+            D3D11_TEXTURE2D_DESC textureDesc = {};
+            texture->GetDesc(&textureDesc);
+            g_TextureWidth = static_cast<float>(textureDesc.Width);
+            g_TextureHeight = static_cast<float>(textureDesc.Height);
+            texture->Release();
+        }
+    }
+
+    if (!ImGui_ImplWin32_Init(g_hWindow)) {
+        Log("ImGui Win32 backend initialization failed.");
+        FinalizeRendererShutdownLocked();
+        return false;
+    }
+    g_win32BackendInitialized = true;
+
+    if (!ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext)) {
+        Log("ImGui DX11 backend initialization failed.");
+        FinalizeRendererShutdownLocked();
+        return false;
+    }
+    g_dx11BackendInitialized = true;
+
+    const std::uintptr_t rendererToken =
+        reinterpret_cast<std::uintptr_t>(pSwapChain);
+    if (!g_WindowSubclass.RequestInstall(
+            g_hWindow,
+            rendererToken) &&
+        !g_WindowSubclass.IsInstalledFor(
+            g_hWindow,
+            rendererToken)) {
+        LogSubclassFailureLocked();
+        if (g_WindowSubclass.CanDisposeRenderer()) {
+            FinalizeRendererShutdownLocked();
+        }
+        return false;
+    }
+    return CompleteRendererActivationLocked();
+}
+
+bool EnsureRendererLocked(
+    IDXGISwapChain* pSwapChain,
+    ID3D11Device* device,
+    HWND window
+) {
+    const bool sameOwnership =
+        g_pRendererSwapChain == pSwapChain &&
+        g_pd3dDevice == device &&
+        g_hWindow == window;
+
+    if (sameOwnership && HasRendererResourcesLocked()) {
+        return CompleteRendererActivationLocked();
+    }
+
+    if (HasRendererResourcesLocked() &&
+        !ShutdownRendererLocked()) {
+        return false;
+    }
+
+    if (g_WindowSubclass.IsInstallBlockedFor(
+            window,
+            reinterpret_cast<std::uintptr_t>(pSwapChain))) {
+        LogSubclassFailureLocked();
+        return false;
+    }
+    return InitializeRendererLocked(pSwapChain, device);
 }
 
 void DrawRemapper(const char* label, int& key) {
@@ -717,7 +932,7 @@ void DrawRemapper(const char* label, int& key) {
         g_isRemapping = true;
         ImGui::Text("Press any key...");
         for (int i = 1; i < 256; i++) {
-            if (g_pfnOriginalGetAsyncKeyState(i) & 0x8000) {
+            if (GetAsyncKeyState(i) & 0x8000) {
                 if (i != VK_LBUTTON && i != VK_RBUTTON) {
                     key = i;
                     ImGui::CloseCurrentPopup();
@@ -734,43 +949,35 @@ void DrawRemapper(const char* label, int& key) {
     }
 }
 
-HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
-    static int frameCount = 0;
-    frameCount++;
-    if (frameCount <= 3) {
-        Log("Present called, frame " + std::to_string(frameCount));
-    }
-
-    D3D11StateSaver stateSaver(g_pd3dDeviceContext);
-    InitImGui(pSwapChain);
-
-    if (!g_imguiInitialized) {
-        return g_pfnOriginalPresent(pSwapChain, SyncInterval, Flags);
-    }
-
-    ID3D11Texture2D* pBackBuffer = nullptr;
-    float actual_width = 0.0f;
-    float actual_height = 0.0f;
-
-    if (SUCCEEDED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer))) {
-        D3D11_TEXTURE2D_DESC desc;
-        pBackBuffer->GetDesc(&desc);
-        actual_width = (float)desc.Width;
-        actual_height = (float)desc.Height;
-        pBackBuffer->Release();
-    }
-
+bool RenderOverlayLocked(IDXGISwapChain* pSwapChain) {
+    ModConfig config = g_ModConfig.Load();
+    bool saveConfigRequested = false;
     ImGui_ImplWin32_NewFrame();
 
     ImGuiIO& io = ImGui::GetIO();
-    if (actual_width > 0.0f && actual_height > 0.0f) {
-        io.DisplaySize.x = actual_width;
-        io.DisplaySize.y = actual_height;
+    const uint64_t renderTargetGeneration =
+        g_renderTargetGeneration.load();
+    const bool backBufferSizeStale =
+        g_pBackBufferSizeSwapChain != pSwapChain ||
+        g_backBufferSizeGeneration != renderTargetGeneration ||
+        g_backBufferWidth <= 0.0f ||
+        g_backBufferHeight <= 0.0f ||
+        !g_canCacheRenderTarget.load();
+    if (backBufferSizeStale) {
+        UpdateBackBufferSizeLocked(pSwapChain);
+    }
+    if (g_backBufferWidth > 0.0f &&
+        g_backBufferHeight > 0.0f) {
+        io.DisplaySize = ImVec2(
+            g_backBufferWidth,
+            g_backBufferHeight
+        );
     }
 
-    if (actual_width != g_lastDisplayWidth || actual_height != g_lastDisplayHeight) {
-        g_lastDisplayWidth = actual_width;
-        g_lastDisplayHeight = actual_height;
+    if (io.DisplaySize.x != g_lastDisplayWidth || io.DisplaySize.y != g_lastDisplayHeight) {
+        g_lastDisplayWidth = io.DisplaySize.x;
+        g_lastDisplayHeight = io.DisplaySize.y;
+        std::lock_guard<std::mutex> lock(g_BgmMutex);
         if (g_toastCurrentX != -10000.0f && g_toastTimer > 0.0f) {
             g_toastCurrentX = -10000.0f;
         }
@@ -781,57 +988,62 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
     
     g_isRemapping = false; // Reset remapping flag every frame
 
-    if (g_showMenu) {
+    bool showMenu = g_showMenu.load();
+    if (showMenu) {
         ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("Falcom BGM Info Settings", &g_showMenu)) {
-            ImGui::Checkbox("Ignore Cooldown (Always Show)", &g_ModConfig.ignoreCooldown);
-            ImGui::Checkbox("Show Japanese Name", &g_ModConfig.showJapanese);
-            ImGui::SliderFloat("Toast Duration", &g_ModConfig.toastDuration, 1.0f, 20.0f, "%.1f seconds");
-            ImGui::SliderFloat("UI Scale", &g_ModConfig.uiScale, 0.3f, 2.0f, "%.2f");
+        if (ImGui::Begin("Falcom BGM Info Settings", &showMenu)) {
+            ImGui::Checkbox("Ignore Cooldown (Always Show)", &config.ignoreCooldown);
+            ImGui::Checkbox("Show Japanese Name", &config.showJapanese);
+            ImGui::SliderFloat("Toast Duration", &config.toastDuration, 1.0f, 20.0f, "%.1f seconds");
+            ImGui::SliderFloat("UI Scale", &config.uiScale, 0.3f, 2.0f, "%.2f");
             
-            int h = g_ModConfig.cooldownHours;
+            int h = config.cooldownHours;
             if (ImGui::SliderInt("Cooldown (Hours)", &h, 0, 24)) {
-                g_ModConfig.cooldownHours = h;
+                config.cooldownHours = h;
             }
             
             ImGui::Separator();
             ImGui::Text("Hotkeys:");
-            DrawRemapper("Menu Hotkey", g_ModConfig.menuHotkey);
-            DrawRemapper("Show Info Hotkey", g_ModConfig.showHotkey);
+            DrawRemapper("Menu Hotkey", config.menuHotkey);
+            DrawRemapper("Show Info Hotkey", config.showHotkey);
             
             if (ImGui::Button("Reset Cooldowns")) { std::lock_guard<std::mutex> lock(g_BgmMutex); g_songLastShown.clear(); }
-            if (ImGui::Button("Save Configuration")) SaveConfig();
+            if (ImGui::Button("Save Configuration")) {
+                saveConfigRequested = true;
+            }
         }
         ImGui::End();
-        
-        if (!g_showMenu) {
+
+        g_ModConfig.Store(config);
+        g_showMenu = showMenu;
+        if (!showMenu) {
             io.ConfigFlags |= ImGuiConfigFlags_NoMouse;
             io.ConfigFlags |= ImGuiConfigFlags_NoKeyboard;
             io.MouseDrawCursor = false;
-            SaveConfig();
+            saveConfigRequested = true;
         }
     }
 
-    const float UI_SCALE = g_ModConfig.uiScale;
+    const float UI_SCALE = config.uiScale;
     const float SCREEN_PADDING = 10.0f;
     const float TEXT_PADDING_X = 20.0f * UI_SCALE;
     const float TEXT_PADDING_Y = 15.0f * UI_SCALE;
 
     {
         std::lock_guard<std::mutex> lock(g_BgmMutex);
-        std::string line1 = g_currentBgmInfo.songName;
-        std::string line2 = "";
-        if (g_ModConfig.showJapanese && !g_currentBgmInfo.japaneseName.empty()) {
-            line2 = "(" + g_currentBgmInfo.japaneseName + ")";
-        }
-        std::string line3 = g_currentBgmInfo.version;
-        std::string line4 = "";
-        if (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) {
-            line4 = "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track;
-        }
-        std::string line5 = g_currentBgmInfo.album;
+        if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !g_currentBgmInfo.songName.empty()) {
+            std::string line1 = g_currentBgmInfo.songName;
+            std::string line2 = "";
+            if (config.showJapanese && !g_currentBgmInfo.japaneseName.empty()) {
+                line2 = "(" + g_currentBgmInfo.japaneseName + ")";
+            }
+            std::string line3 = g_currentBgmInfo.version;
+            std::string line4 = "";
+            if (!g_currentBgmInfo.disc.empty() || !g_currentBgmInfo.track.empty()) {
+                line4 = "Disc " + g_currentBgmInfo.disc + ", Track " + g_currentBgmInfo.track;
+            }
+            std::string line5 = g_currentBgmInfo.album;
 
-        if ((g_toastTimer > 0.0f || g_toastCurrentX != -10000.0f) && !line1.empty()) {
             bool fontPushed = false;
             if (g_pToastFont && g_pToastFont->IsLoaded()) {
                 ImGui::PushFont(g_pToastFont);
@@ -935,17 +1147,95 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
 
     ImGui::Render();
 
-    ID3D11RenderTargetView* pRTV = nullptr;
-    ID3D11Texture2D* pBackBufferTex = nullptr;
-    if (SUCCEEDED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBufferTex))) {
-        g_pd3dDevice->CreateRenderTargetView(pBackBufferTex, NULL, &pRTV);
-        pBackBufferTex->Release();
+    ImDrawData* drawData = ImGui::GetDrawData();
+    if (drawData && drawData->TotalVtxCount > 0) {
+        std::lock_guard<std::mutex> lock(g_RenderTargetMutex);
+        ID3D11RenderTargetView* renderTargetView = nullptr;
+        bool releaseRenderTarget = false;
+
+        if (g_resizeInProgress.load()) {
+            renderTargetView = nullptr;
+        } else if (g_canCacheRenderTarget.load()) {
+            if (EnsureCachedRenderTargetLocked(pSwapChain)) {
+                renderTargetView = g_pd3dRenderTargetView;
+            }
+        } else if (SUCCEEDED(CreateRenderTargetView(pSwapChain, g_pd3dDevice, &renderTargetView))) {
+            releaseRenderTarget = true;
+        }
+
+        if (renderTargetView) {
+            ID3D11RenderTargetView* previousRenderTargets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+            ID3D11DepthStencilView* previousDepthStencil = nullptr;
+            g_pd3dDeviceContext->OMGetRenderTargets(
+                D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                previousRenderTargets,
+                &previousDepthStencil
+            );
+            g_pd3dDeviceContext->OMSetRenderTargets(1, &renderTargetView, nullptr);
+            ImGui_ImplDX11_RenderDrawData(drawData);
+            g_pd3dDeviceContext->OMSetRenderTargets(
+                D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+                previousRenderTargets,
+                previousDepthStencil
+            );
+
+            for (ID3D11RenderTargetView* previousRenderTarget : previousRenderTargets) {
+                if (previousRenderTarget) {
+                    previousRenderTarget->Release();
+                }
+            }
+            if (previousDepthStencil) {
+                previousDepthStencil->Release();
+            }
+        }
+
+        if (releaseRenderTarget && renderTargetView) {
+            renderTargetView->Release();
+        }
     }
 
-    if (pRTV) {
-        g_pd3dDeviceContext->OMSetRenderTargets(1, &pRTV, NULL);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        pRTV->Release();
+    return saveConfigRequested;
+}
+
+HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+    static std::atomic<int> frameCount = 0;
+    const int currentFrame = frameCount.fetch_add(1) + 1;
+    if (currentFrame <= 3) {
+        Log("Present called, frame " + std::to_string(currentFrame));
+    }
+
+    ID3D11Device* presentDevice = nullptr;
+    const HRESULT deviceResult = pSwapChain->GetDevice(
+        __uuidof(ID3D11Device),
+        reinterpret_cast<void**>(&presentDevice)
+    );
+    DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
+    const HRESULT descriptionResult =
+        pSwapChain->GetDesc(&swapChainDesc);
+    bool saveConfigRequested = false;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_RendererMutex);
+        if (g_resizeInProgress.load()) {
+            saveConfigRequested = false;
+        } else if (g_shutdownRequested.load()) {
+            ShutdownRendererLocked();
+        } else if (SUCCEEDED(deviceResult) &&
+                   SUCCEEDED(descriptionResult) &&
+                   swapChainDesc.OutputWindow &&
+                   EnsureRendererLocked(
+                       pSwapChain,
+                       presentDevice,
+                       swapChainDesc.OutputWindow)) {
+            saveConfigRequested = RenderOverlayLocked(pSwapChain);
+        }
+    }
+
+    if (presentDevice) {
+        presentDevice->Release();
+    }
+    if (saveConfigRequested) {
+        SaveConfig();
     }
 
     return g_pfnOriginalPresent(pSwapChain, SyncInterval, Flags);
@@ -954,41 +1244,37 @@ HRESULT WINAPI My_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Fl
 // =============================================================
 // FILE SYSTEM HOOKS
 // =============================================================
-bool IsTargetFile(const std::string& fname) {
-    if (fname.length() < 5) return false;
-    std::string ext4 = fname.substr(fname.length() - 4);
-    std::string ext5 = fname.length() >= 5 ? fname.substr(fname.length() - 5) : "";
-    std::transform(ext4.begin(), ext4.end(), ext4.begin(), ::tolower);
-    std::transform(ext5.begin(), ext5.end(), ext5.begin(), ::tolower);
-
-    if (g_Config.useWav && ext4 == ".wav") return true;
-    if (g_Config.useOpus && (ext5 == ".opus" || ext4 == ".ogg")) return true;
-    return false;
+void SignalBgmWorker() {
+    HANDLE wakeEvent = g_workerWakeEvent.load();
+    if (wakeEvent) {
+        SetEvent(wakeEvent);
+    }
 }
 
-bool IsTargetFileW(const std::wstring& fname) {
-    if (fname.length() < 5) return false;
-    std::wstring ext4 = fname.substr(fname.length() - 4);
-    std::wstring ext5 = fname.length() >= 5 ? fname.substr(fname.length() - 5) : L"";
-    std::transform(ext4.begin(), ext4.end(), ext4.begin(), ::towlower);
-    std::transform(ext5.begin(), ext5.end(), ext5.begin(), ::towlower);
+bool IsTargetFile(const char* filename) {
+    return bgm_path::IsModernAudioFile(filename, g_Config.useWav, g_Config.useOpus);
+}
 
-    if (g_Config.useWav && ext4 == L".wav") return true;
-    if (g_Config.useOpus && (ext5 == L".opus" || ext4 == L".ogg")) return true;
-    return false;
+bool IsTargetFileW(const wchar_t* filename) {
+    return bgm_path::IsModernAudioFile(filename, g_Config.useWav, g_Config.useOpus);
 }
 
 typedef HANDLE(WINAPI* PFN_CREATEFILEW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static PFN_CREATEFILEW g_pfnOriginalCreateFileW = nullptr;
 HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
+    bool queued = false;
     if (lpFileName && IsTargetFileW(lpFileName)) {
         if (g_bufferMutex.try_lock()) {
             if (!g_bNewBgmAvailable) {
                 WCharToString(lpFileName, g_bgmFilenameBuffer, MAX_PATH);
                 g_bNewBgmAvailable = true;
+                queued = true;
             }
             g_bufferMutex.unlock();
         }
+    }
+    if (queued) {
+        SignalBgmWorker();
     }
     return g_pfnOriginalCreateFileW(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -996,14 +1282,19 @@ HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwSha
 typedef HANDLE(WINAPI* PFN_CREATEFILEA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static PFN_CREATEFILEA g_pfnOriginalCreateFileA = nullptr;
 HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
+    bool queued = false;
     if (lpFileName && IsTargetFile(lpFileName)) {
         if (g_bufferMutex.try_lock()) {
             if (!g_bNewBgmAvailable) {
                 strcpy_s(g_bgmFilenameBuffer, MAX_PATH, lpFileName);
                 g_bNewBgmAvailable = true;
+                queued = true;
             }
             g_bufferMutex.unlock();
         }
+    }
+    if (queued) {
+        SignalBgmWorker();
     }
     return g_pfnOriginalCreateFileA(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -1011,14 +1302,19 @@ HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShar
 typedef void(__fastcall* PFN_SOUNDMANAGER)(uintptr_t rcx, const char* rdx_filename, uintptr_t r8, uintptr_t r9);
 static PFN_SOUNDMANAGER g_pfnOriginalSoundManager = nullptr;
 void __fastcall My_SoundManager(uintptr_t rcx, const char* rdx_filename, uintptr_t r8, uintptr_t r9) {
+    bool queued = false;
     if (rdx_filename) {
         if (g_bufferMutex.try_lock()) {
             if (!g_bNewBgmAvailable) {
                 strcpy_s(g_bgmFilenameBuffer, MAX_PATH, rdx_filename);
                 g_bNewBgmAvailable = true;
+                queued = true;
             }
             g_bufferMutex.unlock();
         }
+    }
+    if (queued) {
+        SignalBgmWorker();
     }
     g_pfnOriginalSoundManager(rcx, rdx_filename, r8, r9);
 }
@@ -1032,26 +1328,21 @@ void ProcessBgmTrigger(const std::string& s_filename) {
     g_lastTriggeredFile = s_filename;
     Log("Processing: " + s_filename);
 
-    std::string normalizedInput = s_filename;
-    std::replace(normalizedInput.begin(), normalizedInput.end(), '/', '\\');
+    std::string normalizedInput = bgm_path::NormalizeLookupPath(s_filename);
 
-    for (auto& entry : g_bgmMap) {
-        std::string key = entry.first;
-        std::replace(key.begin(), key.end(), '/', '\\');
+    for (const auto& entry : g_bgmMap) {
+        if (bgm_path::HasExactSuffix(normalizedInput, entry.first)) {
 
-        if (normalizedInput.length() >= key.length() &&
-            normalizedInput.compare(normalizedInput.length() - key.length(), key.length(), key) == 0) {
+            Log("MATCH FOUND for: " + entry.first);
 
-            Log("MATCH FOUND for: " + key);
-
+            const ModConfig config = g_ModConfig.Load();
             std::lock_guard<std::mutex> lock(g_BgmMutex);
             g_currentBgmInfo = entry.second;
-            g_currentBgmInfo.rawFileName = entry.first;
 
             std::string songKey = g_currentBgmInfo.songName;
             bool shouldShow = false;
 
-            if (g_ModConfig.ignoreCooldown) {
+            if (config.ignoreCooldown) {
                 shouldShow = true;
             } else {
                 auto it = g_songLastShown.find(songKey);
@@ -1060,12 +1351,12 @@ void ProcessBgmTrigger(const std::string& s_filename) {
                 } else {
                     auto now = std::chrono::steady_clock::now();
                     auto hours = std::chrono::duration_cast<std::chrono::hours>(now - it->second).count();
-                    if (hours >= g_ModConfig.cooldownHours) shouldShow = true;
+                    if (hours >= config.cooldownHours) shouldShow = true;
                 }
             }
 
             if (shouldShow) {
-                g_toastTimer = g_ModConfig.toastDuration;
+                g_toastTimer = config.toastDuration;
                 g_songLastShown[songKey] = std::chrono::steady_clock::now();
                 g_toastCurrentX = -10000.0f;
             }
@@ -1077,6 +1368,15 @@ void ProcessBgmTrigger(const std::string& s_filename) {
 void BgmWorkerThread() {
     Log("BGM Worker Thread started.");
     while (g_bWorkerThreadActive) {
+        HANDLE wakeEvent = g_workerWakeEvent.load();
+        if (wakeEvent) {
+            WaitForSingleObject(wakeEvent, INFINITE);
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!g_bWorkerThreadActive) {
+            break;
+        }
         if (g_bNewBgmAvailable) {
             std::string fname;
             {
@@ -1086,15 +1386,20 @@ void BgmWorkerThread() {
             }
             ProcessBgmTrigger(fname);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     Log("BGM Worker Thread shutting down.");
+    FlushLog();
 }
 
 // =============================================================
 // HOOK INITIALIZATION
 // =============================================================
-uintptr_t FindPresentAddress(HWND hWnd) {
+struct DxgiHookAddresses {
+    uintptr_t present = 0;
+    uintptr_t resizeBuffers = 0;
+};
+
+DxgiHookAddresses FindDxgiHookAddresses(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof(sd));
     sd.BufferCount = 2;
@@ -1110,10 +1415,11 @@ uintptr_t FindPresentAddress(HWND hWnd) {
 
     HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &sd, &pSwapChain, &pDevice, NULL, NULL);
 
-    uintptr_t pPresentAddr = 0;
+    DxgiHookAddresses addresses;
     if (SUCCEEDED(hr)) {
         void** pVTable = *(void***)pSwapChain;
-        pPresentAddr = (uintptr_t)pVTable[8];
+        addresses.present = reinterpret_cast<uintptr_t>(pVTable[8]);
+        addresses.resizeBuffers = reinterpret_cast<uintptr_t>(pVTable[13]);
         pSwapChain->Release();
         pDevice->Release();
     } else {
@@ -1122,7 +1428,7 @@ uintptr_t FindPresentAddress(HWND hWnd) {
         Log(ss.str());
     }
 
-    return pPresentAddr;
+    return addresses;
 }
 
 void InitializeHooks() {
@@ -1134,23 +1440,39 @@ void InitializeHooks() {
     }
     s_bInitialized = true;
 
+    // Process-lifetime proxy policy: callbacks and detached workers retain code
+    // addresses indefinitely. Pin after loader-lock exit; explicit dynamic
+    // unloading is intentionally unsupported and process shutdown owns handles.
+    if (!PinModuleForProcessLifetime()) {
+        Log("Failed to pin the proxy module; hooks were not installed.");
+        FlushLog();
+        return;
+    }
+    g_WindowSubclass.Configure(
+        g_ModuleHandle,
+        WndProc,
+        kBgmInfoSubclassId
+    );
+
     Log("Hook thread started.");
 
     DetectAndConfigure();
     LoadConfig();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CoInitializeScope coInitializeScope{SUCCEEDED(hr)};
     if (FAILED(hr)) {
         Log("CoInitializeEx failed! HR: " + std::to_string(hr));
     } else {
         Log("CoInitializeEx successful.");
     }
 
-    // Don't block for window here - we'll get it from the swap chain in InitImGui
+    // Don't block for the game window here; renderer initialization gets it from the active swap chain.
     // Create a temporary window for vtable discovery
     HWND hTempWnd = CreateWindowExA(0, "STATIC", "TempD3D11Window", 0, 0, 0, 1, 1, NULL, NULL, NULL, NULL);
     if (!hTempWnd) {
         Log("Failed to create temporary window for hook discovery");
+        FlushLog();
         return;
     }
 
@@ -1158,6 +1480,7 @@ void InitializeHooks() {
     if (mhStatus != MH_OK && mhStatus != MH_ERROR_ALREADY_INITIALIZED) {
         Log("MH_Initialize failed with status: " + std::to_string(mhStatus));
         DestroyWindow(hTempWnd);
+        FlushLog();
         return;
     }
     Log("MH_Initialize successful.");
@@ -1165,7 +1488,9 @@ void InitializeHooks() {
     LoadBgmMap();
 
     g_bWorkerThreadActive = true;
+    g_workerWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_workerThread = std::thread(BgmWorkerThread);
+    g_workerThread.detach();
 
     if (g_Config.soundManagerRVA != 0) {
         uintptr_t base = (uintptr_t)GetModuleHandle(NULL);
@@ -1195,40 +1520,46 @@ void InitializeHooks() {
         }
     }
 
-    HMODULE hUser32 = GetModuleHandleA("user32.dll");
-    if (hUser32) {
-        MH_CreateHook(GetProcAddress(hUser32, "SetCursorPos"), &Detour_SetCursorPos, (LPVOID*)&g_pfnOriginalSetCursorPos);
-        MH_CreateHook(GetProcAddress(hUser32, "ClipCursor"), &Detour_ClipCursor, (LPVOID*)&g_pfnOriginalClipCursor);
-        MH_CreateHook(GetProcAddress(hUser32, "GetAsyncKeyState"), &Detour_GetAsyncKeyState, (LPVOID*)&g_pfnOriginalGetAsyncKeyState);
-        MH_CreateHook(GetProcAddress(hUser32, "GetKeyState"), &Detour_GetKeyState, (LPVOID*)&g_pfnOriginalGetKeyState);
-        MH_CreateHook(GetProcAddress(hUser32, "GetKeyboardState"), &Detour_GetKeyboardState, (LPVOID*)&g_pfnOriginalGetKeyboardState);
-        
-        MH_CreateHook(GetProcAddress(hUser32, "PeekMessageA"), &Detour_PeekMessageA, (LPVOID*)&g_pfnOriginalPeekMessageA);
-        MH_CreateHook(GetProcAddress(hUser32, "PeekMessageW"), &Detour_PeekMessageW, (LPVOID*)&g_pfnOriginalPeekMessageW);
-        MH_CreateHook(GetProcAddress(hUser32, "GetMessageA"), &Detour_GetMessageA, (LPVOID*)&g_pfnOriginalGetMessageA);
-        MH_CreateHook(GetProcAddress(hUser32, "GetMessageW"), &Detour_GetMessageW, (LPVOID*)&g_pfnOriginalGetMessageW);
-        Log("User32 hooks enabled (including PeekMessage/GetMessage).");
-    }
-
     // Gamepad blocking removed as requested
-    uintptr_t pPresentAddr = FindPresentAddress(hTempWnd);
+    DxgiHookAddresses hookAddresses = FindDxgiHookAddresses(hTempWnd);
     DestroyWindow(hTempWnd);  // Done with temp window
 
-    if (pPresentAddr) {
+    if (hookAddresses.resizeBuffers) {
+        MH_STATUS resizeCreateStatus = MH_CreateHook(
+            reinterpret_cast<LPVOID>(hookAddresses.resizeBuffers),
+            &My_ResizeBuffers,
+            reinterpret_cast<LPVOID*>(&g_pfnOriginalResizeBuffers)
+        );
+        if (resizeCreateStatus == MH_OK) {
+            MH_STATUS resizeEnableStatus = MH_EnableHook(reinterpret_cast<LPVOID>(hookAddresses.resizeBuffers));
+            if (resizeEnableStatus == MH_OK || resizeEnableStatus == MH_ERROR_ENABLED) {
+                g_canCacheRenderTarget = true;
+                Log("ResizeBuffers hook enabled; render-target caching active.");
+            } else {
+                Log("ResizeBuffers hook could not be enabled; using per-frame render targets.");
+            }
+        } else {
+            Log("ResizeBuffers hook could not be created; using per-frame render targets.");
+        }
+    }
+
+    if (hookAddresses.present) {
         std::stringstream ss;
-        ss << "FindPresentAddress successful. Found at: 0x" << std::hex << pPresentAddr;
+        ss << "FindDxgiHookAddresses successful. Present found at: 0x" << std::hex << hookAddresses.present;
         Log(ss.str());
-        if (MH_CreateHook((LPVOID)pPresentAddr, &My_Present, (LPVOID*)&g_pfnOriginalPresent) != MH_OK) {
+        if (MH_CreateHook(reinterpret_cast<LPVOID>(hookAddresses.present), &My_Present, reinterpret_cast<LPVOID*>(&g_pfnOriginalPresent)) != MH_OK) {
             Log("MH_CreateHook for Present failed!");
         } else {
             Log("MH_CreateHook for Present successful.");
         }
     } else {
-        Log("FindPresentAddress FAILED!");
+        Log("FindDxgiHookAddresses FAILED to find Present!");
     }
 
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
         Log("MH_EnableHook(MH_ALL_HOOKS) failed!");
+        g_bWorkerThreadActive = false;
+        SignalBgmWorker();
         return;
     }
     Log("All hooks enabled.");
@@ -1239,14 +1570,15 @@ void InitializeHooks() {
 // =============================================================
 BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_ModuleHandle = hModule;
         DisableThreadLibraryCalls(hModule);
         DetectProxyType(hModule);
         std::thread(InitializeHooks).detach();
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
-        // Minimal cleanup only - full cleanup causes hanging in some games
+        g_shutdownRequested = true;
         g_bWorkerThreadActive = false;
-        // Don't join thread or release resources - let OS handle it
+        SignalBgmWorker();
     }
 
     return TRUE;

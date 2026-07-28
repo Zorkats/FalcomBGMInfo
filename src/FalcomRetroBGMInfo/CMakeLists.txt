@@ -54,6 +54,7 @@ target_link_libraries(FalcomRetroBGMInfo PRIVATE
 
         # Windows system libraries
         shlwapi
+        comctl32
         d3d11
         winmm
 )
