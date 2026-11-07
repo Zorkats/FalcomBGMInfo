@@ -55,9 +55,27 @@ inline std::string NormalizeLookupPath(std::string path) {
     return path;
 }
 
-inline bool HasExactSuffix(const std::string& value, const std::string& suffix) {
-    return value.length() >= suffix.length() &&
-           value.compare(value.length() - suffix.length(), suffix.length(), suffix) == 0;
+// Folds one path character for comparison: ASCII letters to lowercase and '/' to '\'.
+inline char FoldPathChar(char value) {
+    return value == '/' ? '\\' : ToLowerAscii(value);
+}
+
+// True when `path` ends with `suffix`. Windows paths ignore case, and games mix '/' and '\',
+// so both are folded. Compares in place without allocating, because the file hooks call it.
+inline bool EndsWithPath(const char* path, const char* suffix) {
+    const size_t pathLength = Length(path);
+    const size_t suffixLength = Length(suffix);
+    if (suffixLength == 0 || suffixLength > pathLength) {
+        return false;
+    }
+
+    const char* tail = path + (pathLength - suffixLength);
+    for (size_t index = 0; index < suffixLength; ++index) {
+        if (FoldPathChar(tail[index]) != FoldPathChar(suffix[index])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline bool IsModernAudioFile(const char* filename, bool useWav, bool useOpus) {

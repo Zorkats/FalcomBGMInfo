@@ -6,6 +6,7 @@
 #include <psapi.h>
 #include "universal_proxy_x64.h"
 #include <d3d11.h>
+#include <dxgi1_4.h>
 #pragma comment(lib, "d3d11.lib")
 #include <DDSTextureLoader.h>
 #include <DirectXTex.h>
@@ -472,6 +473,8 @@ typedef HRESULT(WINAPI* PFN_PRESENT)(IDXGISwapChain* pSwapChain, UINT SyncInterv
 static PFN_PRESENT g_pfnOriginalPresent = nullptr;
 typedef HRESULT(WINAPI* PFN_RESIZEBUFFERS)(IDXGISwapChain* pSwapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags);
 static PFN_RESIZEBUFFERS g_pfnOriginalResizeBuffers = nullptr;
+typedef HRESULT(WINAPI* PFN_RESIZEBUFFERS1)(IDXGISwapChain3* pSwapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT SwapChainFlags, const UINT* pCreationNodeMask, IUnknown* const* ppPresentQueue);
+static PFN_RESIZEBUFFERS1 g_pfnOriginalResizeBuffers1 = nullptr;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 void ReleaseRenderTargetLocked() {
@@ -632,6 +635,31 @@ LRESULT CALLBACK WndProc(
     return DefSubclassProc(hWnd, uMsg, wParam, lParam);
 }
 
+// A resize fails while anyone still holds a view on the back buffer, so the
+// cached view is released before every resize. DXGI can implement one resize
+// call on top of the other, so the hooks may nest on one thread; only the
+// outermost call releases the view and clears the in-progress flag.
+static thread_local int t_resizeDepth = 0;
+
+template <typename ResizeCall>
+HRESULT ResizeWithoutCachedRenderTarget(IDXGISwapChain* pSwapChain, ResizeCall&& resize) {
+    if (t_resizeDepth++ == 0) {
+        g_resizeInProgress = true;
+        g_renderTargetGeneration.fetch_add(1);
+        std::lock_guard<std::mutex> lock(g_RenderTargetMutex);
+        if (pSwapChain == g_pRenderTargetSwapChain) {
+            ReleaseRenderTargetLocked();
+        }
+    }
+
+    const HRESULT result = resize();
+    if (--t_resizeDepth == 0) {
+        g_renderTargetGeneration.fetch_add(1);
+        g_resizeInProgress = false;
+    }
+    return result;
+}
+
 HRESULT WINAPI My_ResizeBuffers(
     IDXGISwapChain* pSwapChain,
     UINT BufferCount,
@@ -640,26 +668,27 @@ HRESULT WINAPI My_ResizeBuffers(
     DXGI_FORMAT NewFormat,
     UINT SwapChainFlags
 ) {
-    g_resizeInProgress = true;
-    g_renderTargetGeneration.fetch_add(1);
-    {
-        std::lock_guard<std::mutex> lock(g_RenderTargetMutex);
-        if (pSwapChain == g_pRenderTargetSwapChain) {
-            ReleaseRenderTargetLocked();
-        }
-    }
+    return ResizeWithoutCachedRenderTarget(pSwapChain, [&]() {
+        return g_pfnOriginalResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+    });
+}
 
-    HRESULT result = g_pfnOriginalResizeBuffers(
-        pSwapChain,
-        BufferCount,
-        Width,
-        Height,
-        NewFormat,
-        SwapChainFlags
-    );
-    g_renderTargetGeneration.fetch_add(1);
-    g_resizeInProgress = false;
-    return result;
+// Flip-model swap chains can resize through ResizeBuffers1 instead, which
+// SpecialK and other overlays use when they change the back-buffer format.
+HRESULT WINAPI My_ResizeBuffers1(
+    IDXGISwapChain3* pSwapChain,
+    UINT BufferCount,
+    UINT Width,
+    UINT Height,
+    DXGI_FORMAT Format,
+    UINT SwapChainFlags,
+    const UINT* pCreationNodeMask,
+    IUnknown* const* ppPresentQueue
+) {
+    return ResizeWithoutCachedRenderTarget(pSwapChain, [&]() {
+        return g_pfnOriginalResizeBuffers1(
+            pSwapChain, BufferCount, Width, Height, Format, SwapChainFlags, pCreationNodeMask, ppPresentQueue);
+    });
 }
 
 bool HasRendererResourcesLocked() {
@@ -1259,22 +1288,56 @@ bool IsTargetFileW(const wchar_t* filename) {
     return bgm_path::IsModernAudioFile(filename, g_Config.useWav, g_Config.useOpus);
 }
 
+// The map is filled before any hook is enabled and never changes afterwards,
+// so hook threads can read it concurrently without a lock.
+const std::pair<const std::string, BgmInfo>* FindBgmEntry(const char* path) {
+    for (const auto& entry : g_bgmMap) {
+        if (bgm_path::EndsWithPath(path, entry.first.c_str())) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+// Hands a filename to the worker. The newest name always wins: games open
+// sound effects and probe sibling files around a BGM change, and keeping the
+// first name instead dropped the real track when the worker was still busy.
+void PublishBgmFilename(const char* path) {
+    {
+        std::lock_guard<std::mutex> lock(g_bufferMutex);
+        if (strcpy_s(g_bgmFilenameBuffer, MAX_PATH, path) != 0) {
+            return;
+        }
+        g_bNewBgmAvailable = true;
+    }
+    SignalBgmWorker();
+}
+
+// File hooks only queue mapped tracks, so unrelated audio can't replace a pending BGM name.
+void PublishMappedBgmFilename(const char* path) {
+    if (FindBgmEntry(path)) {
+        PublishBgmFilename(path);
+    }
+}
+
+// Kept out of line so Detour_CreateFileW has no stack buffer and stays a tail call.
+__declspec(noinline) void PublishMappedBgmFilenameW(LPCWSTR lpFileName) {
+    char path[MAX_PATH] = {};
+    WCharToString(lpFileName, path, MAX_PATH);
+    if (path[0] != '\0') {
+        PublishMappedBgmFilename(path);
+    }
+}
+
+// The CreateFile detours must end in a tail jump to the original, so the caller's
+// return address reaches whatever hook runs next. SpecialK's CreateFileW hook lets its
+// own HID opens pass through by checking the calling module. A real call frame here
+// made those opens look foreign, and SpecialK recursed until the stack overflowed.
 typedef HANDLE(WINAPI* PFN_CREATEFILEW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static PFN_CREATEFILEW g_pfnOriginalCreateFileW = nullptr;
 HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
-    bool queued = false;
     if (lpFileName && IsTargetFileW(lpFileName)) {
-        if (g_bufferMutex.try_lock()) {
-            if (!g_bNewBgmAvailable) {
-                WCharToString(lpFileName, g_bgmFilenameBuffer, MAX_PATH);
-                g_bNewBgmAvailable = true;
-                queued = true;
-            }
-            g_bufferMutex.unlock();
-        }
-    }
-    if (queued) {
-        SignalBgmWorker();
+        PublishMappedBgmFilenameW(lpFileName);
     }
     return g_pfnOriginalCreateFileW(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
@@ -1282,39 +1345,18 @@ HANDLE WINAPI Detour_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwSha
 typedef HANDLE(WINAPI* PFN_CREATEFILEA)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static PFN_CREATEFILEA g_pfnOriginalCreateFileA = nullptr;
 HANDLE WINAPI Detour_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare, LPSECURITY_ATTRIBUTES lpSec, DWORD dwDisp, DWORD dwFlags, HANDLE hTemplate) {
-    bool queued = false;
     if (lpFileName && IsTargetFile(lpFileName)) {
-        if (g_bufferMutex.try_lock()) {
-            if (!g_bNewBgmAvailable) {
-                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, lpFileName);
-                g_bNewBgmAvailable = true;
-                queued = true;
-            }
-            g_bufferMutex.unlock();
-        }
-    }
-    if (queued) {
-        SignalBgmWorker();
+        PublishMappedBgmFilename(lpFileName);
     }
     return g_pfnOriginalCreateFileA(lpFileName, dwAccess, dwShare, lpSec, dwDisp, dwFlags, hTemplate);
 }
 
+// The Sky remake SoundManager only receives BGM names, so it publishes without the map filter.
 typedef void(__fastcall* PFN_SOUNDMANAGER)(uintptr_t rcx, const char* rdx_filename, uintptr_t r8, uintptr_t r9);
 static PFN_SOUNDMANAGER g_pfnOriginalSoundManager = nullptr;
 void __fastcall My_SoundManager(uintptr_t rcx, const char* rdx_filename, uintptr_t r8, uintptr_t r9) {
-    bool queued = false;
     if (rdx_filename) {
-        if (g_bufferMutex.try_lock()) {
-            if (!g_bNewBgmAvailable) {
-                strcpy_s(g_bgmFilenameBuffer, MAX_PATH, rdx_filename);
-                g_bNewBgmAvailable = true;
-                queued = true;
-            }
-            g_bufferMutex.unlock();
-        }
-    }
-    if (queued) {
-        SignalBgmWorker();
+        PublishBgmFilename(rdx_filename);
     }
     g_pfnOriginalSoundManager(rcx, rdx_filename, r8, r9);
 }
@@ -1328,40 +1370,35 @@ void ProcessBgmTrigger(const std::string& s_filename) {
     g_lastTriggeredFile = s_filename;
     Log("Processing: " + s_filename);
 
-    std::string normalizedInput = bgm_path::NormalizeLookupPath(s_filename);
+    const auto* entry = FindBgmEntry(s_filename.c_str());
+    if (!entry) return;
 
-    for (const auto& entry : g_bgmMap) {
-        if (bgm_path::HasExactSuffix(normalizedInput, entry.first)) {
+    Log("MATCH FOUND for: " + entry->first);
 
-            Log("MATCH FOUND for: " + entry.first);
+    const ModConfig config = g_ModConfig.Load();
+    std::lock_guard<std::mutex> lock(g_BgmMutex);
+    g_currentBgmInfo = entry->second;
 
-            const ModConfig config = g_ModConfig.Load();
-            std::lock_guard<std::mutex> lock(g_BgmMutex);
-            g_currentBgmInfo = entry.second;
+    std::string songKey = g_currentBgmInfo.songName;
+    bool shouldShow = false;
 
-            std::string songKey = g_currentBgmInfo.songName;
-            bool shouldShow = false;
-
-            if (config.ignoreCooldown) {
-                shouldShow = true;
-            } else {
-                auto it = g_songLastShown.find(songKey);
-                if (it == g_songLastShown.end()) {
-                    shouldShow = true;
-                } else {
-                    auto now = std::chrono::steady_clock::now();
-                    auto hours = std::chrono::duration_cast<std::chrono::hours>(now - it->second).count();
-                    if (hours >= config.cooldownHours) shouldShow = true;
-                }
-            }
-
-            if (shouldShow) {
-                g_toastTimer = config.toastDuration;
-                g_songLastShown[songKey] = std::chrono::steady_clock::now();
-                g_toastCurrentX = -10000.0f;
-            }
-            break;
+    if (config.ignoreCooldown) {
+        shouldShow = true;
+    } else {
+        auto it = g_songLastShown.find(songKey);
+        if (it == g_songLastShown.end()) {
+            shouldShow = true;
+        } else {
+            auto now = std::chrono::steady_clock::now();
+            auto hours = std::chrono::duration_cast<std::chrono::hours>(now - it->second).count();
+            if (hours >= config.cooldownHours) shouldShow = true;
         }
+    }
+
+    if (shouldShow) {
+        g_toastTimer = config.toastDuration;
+        g_songLastShown[songKey] = std::chrono::steady_clock::now();
+        g_toastCurrentX = -10000.0f;
     }
 }
 
@@ -1397,7 +1434,28 @@ void BgmWorkerThread() {
 struct DxgiHookAddresses {
     uintptr_t present = 0;
     uintptr_t resizeBuffers = 0;
+    // Zero when the system has no IDXGISwapChain3 (before Windows 10), so no ResizeBuffers1 exists.
+    uintptr_t resizeBuffers1 = 0;
 };
+
+// Hooks one resize entry point. Returns false if it exists but couldn't be hooked.
+template <typename Detour, typename Original>
+bool HookResizeEntry(uintptr_t address, Detour detour, Original* original, const char* name) {
+    if (!address) {
+        return true;
+    }
+    LPVOID target = reinterpret_cast<LPVOID>(address);
+    if (MH_CreateHook(target, reinterpret_cast<LPVOID>(detour), reinterpret_cast<LPVOID*>(original)) != MH_OK) {
+        Log(std::string(name) + " hook could not be created.");
+        return false;
+    }
+    const MH_STATUS status = MH_EnableHook(target);
+    if (status != MH_OK && status != MH_ERROR_ENABLED) {
+        Log(std::string(name) + " hook could not be enabled.");
+        return false;
+    }
+    return true;
+}
 
 DxgiHookAddresses FindDxgiHookAddresses(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd;
@@ -1420,6 +1478,12 @@ DxgiHookAddresses FindDxgiHookAddresses(HWND hWnd) {
         void** pVTable = *(void***)pSwapChain;
         addresses.present = reinterpret_cast<uintptr_t>(pVTable[8]);
         addresses.resizeBuffers = reinterpret_cast<uintptr_t>(pVTable[13]);
+        IDXGISwapChain3* pSwapChain3 = nullptr;
+        if (SUCCEEDED(pSwapChain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void**>(&pSwapChain3)))) {
+            void** pVTable3 = *(void***)pSwapChain3;
+            addresses.resizeBuffers1 = reinterpret_cast<uintptr_t>(pVTable3[39]);
+            pSwapChain3->Release();
+        }
         pSwapChain->Release();
         pDevice->Release();
     } else {
@@ -1524,22 +1588,19 @@ void InitializeHooks() {
     DxgiHookAddresses hookAddresses = FindDxgiHookAddresses(hTempWnd);
     DestroyWindow(hTempWnd);  // Done with temp window
 
+    // Holding a view across frames is only safe when every resize entry point releases it first.
     if (hookAddresses.resizeBuffers) {
-        MH_STATUS resizeCreateStatus = MH_CreateHook(
-            reinterpret_cast<LPVOID>(hookAddresses.resizeBuffers),
-            &My_ResizeBuffers,
-            reinterpret_cast<LPVOID*>(&g_pfnOriginalResizeBuffers)
-        );
-        if (resizeCreateStatus == MH_OK) {
-            MH_STATUS resizeEnableStatus = MH_EnableHook(reinterpret_cast<LPVOID>(hookAddresses.resizeBuffers));
-            if (resizeEnableStatus == MH_OK || resizeEnableStatus == MH_ERROR_ENABLED) {
-                g_canCacheRenderTarget = true;
-                Log("ResizeBuffers hook enabled; render-target caching active.");
-            } else {
-                Log("ResizeBuffers hook could not be enabled; using per-frame render targets.");
-            }
+        const bool resizeHooked = HookResizeEntry(
+            hookAddresses.resizeBuffers, &My_ResizeBuffers, &g_pfnOriginalResizeBuffers, "ResizeBuffers");
+        const bool resize1Hooked = HookResizeEntry(
+            hookAddresses.resizeBuffers1, &My_ResizeBuffers1, &g_pfnOriginalResizeBuffers1, "ResizeBuffers1");
+        if (resizeHooked && resize1Hooked) {
+            g_canCacheRenderTarget = true;
+            Log(hookAddresses.resizeBuffers1
+                    ? "ResizeBuffers and ResizeBuffers1 hooks enabled; render-target caching active."
+                    : "ResizeBuffers hook enabled (no ResizeBuffers1 on this system); render-target caching active.");
         } else {
-            Log("ResizeBuffers hook could not be created; using per-frame render targets.");
+            Log("Using per-frame render targets.");
         }
     }
 

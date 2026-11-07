@@ -1,0 +1,181 @@
+name: Release
+
+# Pushing a version tag (v2.3.0) builds every package and opens a draft release
+# whose title and notes come from the matching CHANGELOG.md section.
+# Running the workflow by hand builds the same packages as artifacts, without a release.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+env:
+  # Same vcpkg commit the local CLion builds use, so CI links identical library versions.
+  VCPKG_COMMIT: 4ba97a60d0cab61679faae32ad31947109908b4e
+  # d3d8to9 is a third-party wrapper shipped in the Retro package for Xanadu Next.
+  D3D8TO9_VERSION: v1.13.0
+  D3D8TO9_SHA256: 59e15e4ee8596cdef2194275b05ded3c6f8590aa68f483e4daec6a6c99ec2b2d
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            platform: x64
+            triplet: x64-windows
+            packages: yaml-cpp minhook directx-headers directxtk
+            targets: FalcomModernBGMInfo
+          - arch: x86
+            platform: Win32
+            triplet: x86-windows
+            packages: yaml-cpp minhook directx-headers directxtk dxsdk-d3dx
+            targets: FalcomModernBGMInfo FalcomRetroBGMInfo
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-binary-cache
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src-repo
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-${{ matrix.triplet }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src-repo/.github/workflows/release.yml') }}
+          restore-keys: vcpkg-${{ matrix.triplet }}-${{ env.VCPKG_COMMIT }}-
+
+      - name: Install vcpkg packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          git init --quiet $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT fetch --quiet --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_COMMIT
+          git -C $env:VCPKG_ROOT checkout --quiet FETCH_HEAD
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet ${{ matrix.triplet }} ${{ matrix.packages }}
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S src-repo -B build -A ${{ matrix.platform }} `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target ${{ matrix.targets }}
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "$env:VCPKG_ROOT\installed\${{ matrix.triplet }}\bin"
+          $minhook = if ('${{ matrix.arch }}' -eq 'x64') { 'minhook.x64.dll' } else { 'minhook.x32.dll' }
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # Each package mirrors the layout users already know: one top folder holding
+          # the proxy renamed to winmm.dll, its runtime DLLs, and the shared assets folder.
+          function New-Package([string]$name, [string]$proxyDll, [string[]]$runtimeDlls) {
+            $root = "stage\$name"
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+            Copy-Item $proxyDll "$root\winmm.dll"
+            foreach ($dll in $runtimeDlls) { Copy-Item $dll $root }
+            Copy-Item -Recurse src-repo\assets "$root\assets"
+
+            # Fail the build when the proxy imports a DLL that is neither shipped nor a system DLL.
+            $imports = & $dumpbin /nologo /dependents "$root\winmm.dll" |
+              ForEach-Object { $_.Trim() } | Where-Object { $_ -match '\.dll$' -and $_ -notmatch '^Dump of file' }
+            foreach ($import in $imports) {
+              $shipped = Test-Path (Join-Path $root $import)
+              $system = Test-Path (Join-Path "$env:SystemRoot\System32" $import)
+              if (-not $shipped -and -not $system) { throw "$name is missing runtime DLL $import" }
+            }
+
+            # 7-Zip writes portable forward-slash entry names; Compress-Archive has not always.
+            & 7z a -tzip "dist\$name.zip" ".\$root" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Zipping $name failed" }
+          }
+
+          New-Package "FalcomBGMInfo_Modern_${{ matrix.arch }}" `
+            "build\src\FalcomModernBGMInfo\Release\FalcomModernBGMInfo.dll" `
+            @("$bin\yaml-cpp.dll", "$bin\$minhook", "$bin\DirectXTK.dll")
+
+          if ('${{ matrix.arch }}' -eq 'x86') {
+            $d3d8 = "$env:RUNNER_TEMP\d3d8.dll"
+            Invoke-WebRequest "https://github.com/crosire/d3d8to9/releases/download/$env:D3D8TO9_VERSION/d3d8.dll" -OutFile $d3d8
+            $hash = (Get-FileHash $d3d8 -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $env:D3D8TO9_SHA256) { throw "d3d8.dll hash mismatch: $hash" }
+
+            # vcpkg names it D3DX9_43.dll; earlier releases shipped the lowercase name.
+            $d3dx9 = "$env:RUNNER_TEMP\d3dx9_43.dll"
+            Copy-Item "$bin\D3DX9_43.dll" $d3dx9
+
+            New-Package "FalcomBGMInfo_Retro" `
+              "build\src\FalcomRetroBGMInfo\Release\FalcomRetroBGMInfo.dll" `
+              @("$bin\yaml-cpp.dll", "$bin\$minhook", $d3dx9, $d3d8)
+          }
+
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+
+      # The CHANGELOG.md section headed "## [v2.3.0] Some Title" supplies the release
+      # title (text after the tag) and the notes (lines until the next "## " heading).
+      - name: Read changelog section
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          tr -d '\r' < CHANGELOG.md > changelog.lf
+          heading=$(grep -m1 -F "## [${tag}]" changelog.lf || true)
+          if [ -z "$heading" ]; then
+            echo "::error::CHANGELOG.md has no '## [${tag}]' section"
+            exit 1
+          fi
+          title="${heading#"## [${tag}]"}"
+          title="${title#"${title%%[![:space:]]*}"}"
+          echo "RELEASE_TITLE=${title:-$tag}" >> "$GITHUB_ENV"
+          awk -v h="$heading" '$0 == h {found=1; next} found && /^## / {exit} found {print}' changelog.lf > notes.md
+          cat notes.md
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --draft \
+            --verify-tag \
+            --title "$RELEASE_TITLE" \
+            --notes-file notes.md

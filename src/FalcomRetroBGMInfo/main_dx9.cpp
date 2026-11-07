@@ -197,8 +197,21 @@ void SignalBgmWorker() {
     }
 }
 
+// The map is filled before any hook is enabled and never changes afterwards,
+// so hook threads can read it concurrently without a lock.
+const std::pair<const std::string, BgmInfo>* FindBgmEntry(const char* path) {
+    for (const auto& entry : g_bgmMap) {
+        if (bgm_path::EndsWithPath(path, entry.first.c_str())) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+// Only mapped tracks are queued, so sound effects opened around a BGM change
+// can't replace the pending name before the worker reads it.
 bool PublishPendingBgmFilename(const char* filename) {
-    if (!filename) {
+    if (!filename || !FindBgmEntry(filename)) {
         return false;
     }
 
@@ -1069,47 +1082,64 @@ bool IsTargetW(const wchar_t* filename) {
     return bgm_path::IsRetroAudioFile(filename);
 }
 
-HANDLE WINAPI Detour_CreateFileW(LPCWSTR f, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sec, DWORD d, DWORD fl, HANDLE t) {
+void __stdcall NoteCreateFileW(LPCWSTR f) {
     if (f && IsTargetW(f)) {
         PublishPendingBgmFilename(f);
     }
-    return g_pfnOriginalCreateFileW(f, a, s, sec, d, fl, t);
 }
 
-HANDLE WINAPI Detour_CreateFileA(LPCSTR f, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sec, DWORD d, DWORD fl, HANDLE t) {
+void __stdcall NoteCreateFileA(LPCSTR f) {
     if (f && IsTarget(f)) {
         PublishPendingBgmFilename(f);
     }
-    return g_pfnOriginalCreateFileA(f, a, s, sec, d, fl, t);
+}
+
+// The CreateFile detours must end in a tail jump to the original, so the caller's
+// return address reaches whatever hook runs next. SpecialK's CreateFile hooks let its
+// own HID opens pass through by checking the calling module. A real call frame here
+// made those opens look foreign, and SpecialK recursed until the stack overflowed.
+// MSVC never tail-calls __stdcall on x86, so the jump is written by hand: the helper
+// pops its copy of the filename, which leaves the caller's frame exactly as it arrived.
+__declspec(naked) HANDLE WINAPI Detour_CreateFileW(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) {
+    __asm {
+        push dword ptr [esp + 4]
+        call NoteCreateFileW
+        jmp dword ptr [g_pfnOriginalCreateFileW]
+    }
+}
+
+__declspec(naked) HANDLE WINAPI Detour_CreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) {
+    __asm {
+        push dword ptr [esp + 4]
+        call NoteCreateFileA
+        jmp dword ptr [g_pfnOriginalCreateFileA]
+    }
 }
 
 void ProcessBgmTrigger(const std::string& fn) {
     if (fn == g_lastTriggeredFile) return;
     g_lastTriggeredFile = fn;
     
-    const std::string input = bgm_path::NormalizeLookupPath(fn);
-    for (const auto& entry : g_bgmMap) {
-        if (bgm_path::HasExactSuffix(input, entry.first)) {
-            const ModConfig config = g_ModConfig.Load();
-            std::lock_guard<std::mutex> lock(g_BgmMutex);
-            g_currentBgmInfo = entry.second;
+    const auto* entry = FindBgmEntry(fn.c_str());
+    if (!entry) return;
 
-            const auto now = std::chrono::steady_clock::now();
-            const auto lastShown = g_songLastShown.find(entry.second.songName);
-            const bool cooldownExpired =
-                lastShown != g_songLastShown.end() &&
-                std::chrono::duration_cast<std::chrono::hours>(now - lastShown->second).count() >=
-                    config.cooldownHours;
-            const bool show = config.ignoreCooldown ||
-                              lastShown == g_songLastShown.end() ||
-                              cooldownExpired;
-            if (show) {
-                g_toastTimer = config.toastDuration;
-                g_songLastShown[entry.second.songName] = now;
-                g_toastCurrentX = -10000.0f;
-            }
-            break;
-        }
+    const ModConfig config = g_ModConfig.Load();
+    std::lock_guard<std::mutex> lock(g_BgmMutex);
+    g_currentBgmInfo = entry->second;
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto lastShown = g_songLastShown.find(entry->second.songName);
+    const bool cooldownExpired =
+        lastShown != g_songLastShown.end() &&
+        std::chrono::duration_cast<std::chrono::hours>(now - lastShown->second).count() >=
+            config.cooldownHours;
+    const bool show = config.ignoreCooldown ||
+                      lastShown == g_songLastShown.end() ||
+                      cooldownExpired;
+    if (show) {
+        g_toastTimer = config.toastDuration;
+        g_songLastShown[entry->second.songName] = now;
+        g_toastCurrentX = -10000.0f;
     }
 }
 
@@ -1225,7 +1255,8 @@ void LoadBgmMap() {
                 if (pts.size() >= 3) i.disc = pts[2];
                 if (pts.size() >= 4) i.track = pts[3];
                 if (pts.size() >= 5) i.album = pts[4];
-                if (i.japaneseName == i.songName) i.japaneseName = "";
+                // " " marks a track with no Japanese title, same as the DX11 parser.
+                if (i.japaneseName == i.songName || i.japaneseName == " ") i.japaneseName = "";
                 g_bgmMap[bgm_path::NormalizeLookupPath(path)] = i;
             }
         } catch (...) {}
