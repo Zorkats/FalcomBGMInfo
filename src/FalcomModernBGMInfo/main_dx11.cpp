@@ -9,7 +9,6 @@
 #include <dxgi1_4.h>
 #pragma comment(lib, "d3d11.lib")
 #include <DDSTextureLoader.h>
-#include <DirectXTex.h>
 
 #include <MinHook.h>
 
