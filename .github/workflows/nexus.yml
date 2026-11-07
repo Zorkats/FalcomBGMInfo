@@ -1,0 +1,127 @@
+name: Nexus Mods
+
+# Publishing a GitHub release uploads its zips to every Nexus Mods file listed in
+# .github/nexus-files.json, as a new version of that file. Running the workflow by
+# hand does the same for an existing release, or only checks the plan with dry_run.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to upload (for example v2.3.0)
+        required: true
+      dry_run:
+        description: Only validate nexus-files.json and list the planned uploads
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  plan:
+    name: Plan uploads
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each entry needs the IDs shown under "Advanced" on the mod page's Files tab.
+      # Only the first entry of each mod posts the changelog, so a page that hosts
+      # several zips gets one changelog entry per release.
+      - name: Read nexus-files.json
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          config=.github/nexus-files.json
+          packages='["FalcomBGMInfo_Modern_x64.zip","FalcomBGMInfo_Modern_x86.zip","FalcomBGMInfo_Retro.zip"]'
+
+          invalid=$(jq -r --argjson packages "$packages" '
+            .files[] | select(
+              (.page | type) != "string" or
+              (.mod_id | type) != "number" or .mod_id <= 0 or
+              (.file_id | type) != "number" or .file_id <= 0 or
+              (.display_name | type) != "string" or
+              (.package as $p | $packages | index($p) | not)
+            ) | tostring' "$config")
+          if [ -n "$invalid" ]; then
+            echo "::error::Invalid entries in ${config}:"
+            echo "$invalid"
+            exit 1
+          fi
+
+          matrix=$(jq -c '.files as $f | {include: [range(0; $f | length) as $i |
+            $f[$i] + {post_changelog: (any($f[:$i][]; .mod_id == $f[$i].mod_id) | not)}]}' "$config")
+          count=$(jq '.include | length' <<< "$matrix")
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::${config} lists no files, so nothing will be uploaded."
+          fi
+          jq -r '.include[] | "\(.page): \(.package) -> file \(.file_id) as \"\(.display_name)\"" +
+            (if .post_changelog then " (posts changelog to mod \(.mod_id))" else "" end)' <<< "$matrix"
+
+  upload:
+    name: ${{ matrix.page }} / ${{ matrix.package }}
+    needs: plan
+    if: needs.plan.outputs.count != '0' && (github.event_name == 'release' || !inputs.dry_run)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check API key
+        env:
+          NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+        run: |
+          if [ -z "$NEXUSMODS_API_KEY" ]; then
+            echo "::error::The NEXUSMODS_API_KEY repository secret is not set"
+            exit 1
+          fi
+
+      - name: Download release package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "${{ matrix.package }}"
+
+      # Nexus shows changelog text as typed, so the Markdown markers are reduced to plain text.
+      - name: Prepare version and changelog
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          bash .github/scripts/changelog-section.sh "$TAG" notes.md > /dev/null
+          text=$(sed -e 's/^### \(.*\)$/\1:/' -e 's/^\* /- /' -e 's/\*\*//g' -e 's/`//g' notes.md |
+            sed -e '/./,$!d')
+          {
+            echo "text<<NEXUS_CHANGELOG_EOF"
+            echo "$text"
+            echo "NEXUS_CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Nexus Mods
+        # Pinned to the v1.0.0-beta.11 commit, because this step receives the API key.
+        uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_id: ${{ matrix.file_id }}
+          filename: ${{ matrix.package }}
+          version: ${{ steps.notes.outputs.version }}
+          display_name: ${{ matrix.display_name }}
+          category: main
+          archive_existing_version: true
+          update_mod_version: true
+          mod_id: ${{ matrix.post_changelog && matrix.mod_id || '' }}
+          changelog: ${{ matrix.post_changelog && steps.notes.outputs.text || '' }}

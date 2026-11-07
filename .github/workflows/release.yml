@@ -158,17 +158,8 @@ jobs:
       - name: Read changelog section
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
-          tr -d '\r' < CHANGELOG.md > changelog.lf
-          heading=$(grep -m1 -F "## [${tag}]" changelog.lf || true)
-          if [ -z "$heading" ]; then
-            echo "::error::CHANGELOG.md has no '## [${tag}]' section"
-            exit 1
-          fi
-          title="${heading#"## [${tag}]"}"
-          title="${title#"${title%%[![:space:]]*}"}"
-          echo "RELEASE_TITLE=${title:-$tag}" >> "$GITHUB_ENV"
-          awk -v h="$heading" '$0 == h {found=1; next} found && /^## / {exit} found {print}' changelog.lf > notes.md
+          title=$(bash .github/scripts/changelog-section.sh "$GITHUB_REF_NAME" notes.md)
+          echo "RELEASE_TITLE=${title}" >> "$GITHUB_ENV"
           cat notes.md
 
       - name: Create draft release

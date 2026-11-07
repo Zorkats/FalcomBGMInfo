@@ -1,0 +1,109 @@
+{
+  "files": [
+    {
+      "page": "ysmemoriesofcelceta",
+      "mod_id": 11085310590980,
+      "file_id": 7173574,
+      "package": "FalcomBGMInfo_Modern_x86.zip",
+      "display_name": "CelcetaBGMInfo"
+    },
+    {
+      "page": "ystheoathinfelghana",
+      "mod_id": 36193689403393,
+      "file_id": 7173592,
+      "package": "FalcomBGMInfo_Retro.zip",
+      "display_name": "FelghanaBGMInfo"
+    },
+    {
+      "page": "ysviii",
+      "mod_id": 10230612099119,
+      "file_id": 7173604,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "LacrimosaBGMInfo"
+    },
+    {
+      "page": "ysix",
+      "mod_id": 16681652977688,
+      "file_id": 7173571,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "MonstrumNoxBGMInfo"
+    },
+    {
+      "page": "ysvithearkofnapishtim",
+      "mod_id": 36197984370689,
+      "file_id": 7173598,
+      "package": "FalcomBGMInfo_Retro.zip",
+      "display_name": "NapishtimBGMInfo"
+    },
+    {
+      "page": "thelegendofnayutaboundlesstrails",
+      "mod_id": 24644522344451,
+      "file_id": 7173517,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "NayutaBGMInfo"
+    },
+    {
+      "page": "ysorigin",
+      "mod_id": 36228049141761,
+      "file_id": 7173580,
+      "package": "FalcomBGMInfo_Retro.zip",
+      "display_name": "OriginBGMInfo"
+    },
+    {
+      "page": "thelegendofheroestrailsintoreverie",
+      "mod_id": 23854248361994,
+      "file_id": 7173529,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "ReverieBGMInfo"
+    },
+    {
+      "page": "thelegendofheroestrailsofcoldsteel3",
+      "mod_id": 13726715478023,
+      "file_id": 7173556,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "Sen3BGMInfo"
+    },
+    {
+      "page": "thelegendofheroestrailsofcoldsteel4",
+      "mod_id": 36296768618497,
+      "file_id": 7173559,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "Sen4BGMInfo"
+    },
+    {
+      "page": "thelegendofheroestrailsofcoldsteel",
+      "mod_id": 19241453486083,
+      "file_id": 7173541,
+      "package": "FalcomBGMInfo_Modern_x86.zip",
+      "display_name": "SenBGMInfo"
+    },
+    {
+      "page": "trailsintheskyfirstchapter",
+      "mod_id": 34711925686317,
+      "file_id": 7173565,
+      "package": "FalcomBGMInfo_Modern_x64.zip",
+      "display_name": "SoraBGMInfo"
+    },
+    {
+      "page": "thelegendofheroestrailsofcoldsteel2",
+      "mod_id": 36262408880129,
+      "file_id": 7173553,
+      "package": "FalcomBGMInfo_Modern_x86.zip",
+      "display_name": "Trails of Cold Steel II BGM Information"
+    },
+    {
+      "page": "xanadunext",
+      "mod_id": 36404142800897,
+      "file_id": 7173454,
+      "package": "FalcomBGMInfo_Retro.zip",
+      "display_name": "XanaduNextBGMInfo"
+    },
+    {
+      "page": "ysseven",
+      "mod_id": 36258113912833,
+      "file_id": 7173586,
+      "package": "FalcomBGMInfo_Retro.zip",
+      "display_name": "Ys Seven BGM Information"
+    }
+  ]
+}
