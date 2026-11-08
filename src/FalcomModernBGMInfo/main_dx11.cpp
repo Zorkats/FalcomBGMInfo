@@ -333,7 +333,7 @@ void DetectAndConfigure() {
             g_Config.gameName = "Trails in the Sky (Remake)";
             g_Config.windowTitlePart = "Trails in the Sky";
             g_Config.yamlFiles.push_back("BgmMap_Sky.yaml");
-            g_Config.soundManagerRVA = 0x583B10;
+            g_Config.soundManagerRVA = 0x586200; // 1.08
             break;
         default:
             g_Config.gameName = "Unknown Game";
@@ -433,7 +433,7 @@ void LoadMapFile(const std::string& filename) {
             std::string value = node.second.as<std::string>();
             BgmInfo info;
             info.rawFileName = filepath;
-            
+
             std::vector<std::string> parts = SplitString(value, '|');
 
             if (g_CurrentGame == GameID::SkyRemake) {
@@ -1013,7 +1013,7 @@ bool RenderOverlayLocked(IDXGISwapChain* pSwapChain) {
 
     ImGui_ImplDX11_NewFrame();
     ImGui::NewFrame();
-    
+
     g_isRemapping = false; // Reset remapping flag every frame
 
     bool showMenu = g_showMenu.load();
@@ -1024,17 +1024,17 @@ bool RenderOverlayLocked(IDXGISwapChain* pSwapChain) {
             ImGui::Checkbox("Show Japanese Name", &config.showJapanese);
             ImGui::SliderFloat("Toast Duration", &config.toastDuration, 1.0f, 20.0f, "%.1f seconds");
             ImGui::SliderFloat("UI Scale", &config.uiScale, 0.3f, 2.0f, "%.2f");
-            
+
             int h = config.cooldownHours;
             if (ImGui::SliderInt("Cooldown (Hours)", &h, 0, 24)) {
                 config.cooldownHours = h;
             }
-            
+
             ImGui::Separator();
             ImGui::Text("Hotkeys:");
             DrawRemapper("Menu Hotkey", config.menuHotkey);
             DrawRemapper("Show Info Hotkey", config.showHotkey);
-            
+
             if (ImGui::Button("Reset Cooldowns")) { std::lock_guard<std::mutex> lock(g_BgmMutex); g_songLastShown.clear(); }
             if (ImGui::Button("Save Configuration")) {
                 saveConfigRequested = true;
